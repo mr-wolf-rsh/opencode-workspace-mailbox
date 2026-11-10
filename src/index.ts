@@ -1,4 +1,5 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
+import path from "node:path"
 import { normalizeConfig, type MailboxConfig, type NormalizedConfig } from "./config.js"
 import { messageHash, normalizeForHash } from "./hash.js"
 import {
@@ -81,65 +82,184 @@ export const server: Plugin = async (input, options) => {
     }
   }
 
-  function resolveSessionID(event: { type: string; properties?: { sessionID?: string; status?: { type?: string } } }): string | undefined {
-    if (event.type === "session.idle") return event.properties?.sessionID
-    if (event.type === "session.status" && event.properties?.status?.type === "idle") {
-      return event.properties.sessionID
-    }
-    return undefined
+  // ---------------------------------------------------------------------------
+  // Session registry: the wake path needs a session ID to prompt, and Events
+  // alone do not guarantee one for a session that never had a turn.
+  // ---------------------------------------------------------------------------
+  type SessionTrack = { lastSeen: number; busy: boolean }
+  const sessions = new Map<string, SessionTrack>()
+
+  function track(sessionID: string, busy?: boolean): void {
+    if (!sessionID) return
+    const entry = sessions.get(sessionID) ?? { lastSeen: 0, busy: false }
+    entry.lastSeen = Date.now()
+    if (busy !== undefined) entry.busy = busy
+    sessions.set(sessionID, entry)
   }
+
+  function restoreBudget(sessionID: string): void {
+    const state = store.read()
+    const session = state.sessions[sessionID] ?? { autoRounds: 0, lastPromptAt: 0 }
+    session.autoRounds = 0
+    session.noticeKey = undefined
+    state.sessions[sessionID] = session
+    store.write(state)
+  }
+
+  /**
+   * Shared decision path for both triggers: the idle transition and the poll
+   * timer. `poll` additionally refuses to interrupt a busy session.
+   */
+  async function consider(sessionID: string, source: "idle" | "poll"): Promise<void> {
+    if (!cfg.enabled) return
+    if (pendingCount(sessionID) > 0) return
+    if (source === "poll" && sessions.get(sessionID)?.busy) return
+
+    const file = mailboxFile(cfg.mailboxDir, cfg.project)
+    const { open } = readMailbox(file)
+    const state = store.read()
+    const session = state.sessions[sessionID] ?? { autoRounds: 0, lastPromptAt: 0 }
+
+    if (open.length === 0) {
+      // Inbox drained — a later delivery starts with a full budget.
+      if (session.autoRounds !== 0 || session.noticeKey !== undefined) {
+        session.autoRounds = 0
+        session.noticeKey = undefined
+        state.sessions[sessionID] = session
+        store.write(state)
+      }
+      return
+    }
+
+    const fresh = open.filter(
+      (m) => !state.prompted.includes(m.hash) && !state.ownWrites.includes(m.hash),
+    )
+    if (fresh.length === 0) return
+
+    if (session.autoRounds >= cfg.maxAutoRounds) {
+      // One notice per distinct pending set: repeated triggers must not turn
+      // into a toast loop.
+      const noticeKey = fresh
+        .map((m) => m.hash)
+        .sort()
+        .join(",")
+      if (session.noticeKey === noticeKey) return
+      const now = Date.now()
+      if (session.noticeKey !== undefined && now - (session.lastNoticeAt ?? 0) < cfg.cooldownMs) return
+      session.noticeKey = noticeKey
+      session.lastNoticeAt = now
+      state.sessions[sessionID] = session
+      store.write(state)
+      notify(sessionID, buildCapNotice(cfg.project, fresh.length, cfg.maxAutoRounds))
+      return
+    }
+
+    if (Date.now() - session.lastPromptAt < cfg.cooldownMs) return
+
+    recordHashes(state.prompted, fresh.map((m) => m.hash))
+    session.autoRounds += 1
+    session.lastPromptAt = Date.now()
+    session.noticeKey = undefined
+    state.sessions[sessionID] = session
+    store.write(state)
+    dispatchPrompt(sessionID, buildIdlePrompt(cfg.project, fresh))
+  }
+
+  /** The most recently active session that is not mid-turn, if any. */
+  function wakeTarget(): string | undefined {
+    let best: { id: string; at: number } | undefined
+    for (const [id, entry] of sessions) {
+      if (entry.busy) continue
+      if (!best || entry.lastSeen > best.at) best = { id, at: entry.lastSeen }
+    }
+    return best?.id
+  }
+
+  async function poll(): Promise<void> {
+    if (!cfg.enabled) return
+    const sessionID = wakeTarget()
+    if (!sessionID) return
+    try {
+      await consider(sessionID, "poll")
+    } catch (error) {
+      console.error(`[opencode-mailbox] poll error: ${String(error)}`)
+    }
+  }
+
+  // Opt-in wake path: an idle transition only fires on a *change*, so a session
+  // that is already idle would never notice a message written by another
+  // project. The timer makes delivery independent of session transitions.
+  let timer: ReturnType<typeof setInterval> | undefined
+  if (cfg.wake) {
+    timer = setInterval(() => {
+      void poll()
+    }, cfg.pollMs)
+    timer.unref?.()
+  }
+
+  function sameDirectory(candidate: string | undefined): boolean {
+    if (!candidate) return false
+    const rel = path.relative(path.resolve(input.directory), path.resolve(candidate))
+    return rel === ""
+  }
+
+  /**
+   * A resumed session emits no creation event, so seed the registry from the
+   * server once at startup. `lastSeen` uses each session's own update time, so a
+   * stale session can never outrank one that is actually in use.
+   */
+  async function seedSessions(): Promise<void> {
+    if (!cfg.wake) return
+    try {
+      const result = await client.session.list({ query: { directory: input.directory } })
+      const list = (result as {
+        data?: Array<{ id?: string; directory?: string; time?: { updated?: number } }>
+      }).data
+      for (const entry of list ?? []) {
+        if (!entry?.id || !sameDirectory(entry.directory)) continue
+        if (sessions.has(entry.id)) continue
+        sessions.set(entry.id, { lastSeen: entry.time?.updated ?? 0, busy: false })
+      }
+    } catch {
+      // Session registry unavailable — chat.message and idle events still
+      // register sessions as they are used.
+    }
+  }
+
+  void seedSessions()
 
   return {
     event: async ({ event }) => {
       if (!cfg.enabled) return
-      const sessionID = resolveSessionID(event as { type: string; properties?: { sessionID?: string; status?: { type?: string } } })
-      if (!sessionID) return
-      if (pendingCount(sessionID) > 0) return
-
       try {
-        const file = mailboxFile(cfg.mailboxDir, cfg.project)
-        const { open } = readMailbox(file)
-        const state = store.read()
-        const session = state.sessions[sessionID] ?? { autoRounds: 0, lastPromptAt: 0 }
-        const fresh = open.filter(
-          (m) => !state.prompted.includes(m.hash) && !state.ownWrites.includes(m.hash),
-        )
-        if (fresh.length === 0) return
-
-        if (session.autoRounds >= cfg.maxAutoRounds) {
-          // One notice per distinct pending set: repeated idles must not turn
-          // into a toast loop.
-          const noticeKey = fresh
-            .map((m) => m.hash)
-            .sort()
-            .join(",")
-          if (session.noticeKey === noticeKey) return
-          const now = Date.now()
-          if (session.noticeKey !== undefined && now - (session.lastNoticeAt ?? 0) < cfg.cooldownMs) return
-          session.noticeKey = noticeKey
-          session.lastNoticeAt = now
-          state.sessions[sessionID] = session
-          store.write(state)
-          notify(sessionID, buildCapNotice(cfg.project, fresh.length, cfg.maxAutoRounds))
+        if (event.type === "session.idle") {
+          track(event.properties.sessionID, false)
+          await consider(event.properties.sessionID, "idle")
           return
         }
-
-        if (Date.now() - session.lastPromptAt < cfg.cooldownMs) return
-
-        recordHashes(state.prompted, fresh.map((m) => m.hash))
-        session.autoRounds += 1
-        session.lastPromptAt = Date.now()
-        session.noticeKey = undefined
-        state.sessions[sessionID] = session
-        store.write(state)
-        dispatchPrompt(sessionID, buildIdlePrompt(cfg.project, fresh))
+        if (event.type === "session.status") {
+          track(event.properties.sessionID, event.properties.status.type !== "idle")
+          return
+        }
+        if (event.type === "session.created" || event.type === "session.updated") {
+          const info = (event.properties as { info?: { id?: string; directory?: string } }).info
+          if (info?.id && sameDirectory(info.directory)) track(info.id)
+        }
       } catch (error) {
         console.error(`[opencode-mailbox] event handler error: ${String(error)}`)
       }
     },
 
+    dispose: async () => {
+      if (timer) {
+        clearInterval(timer)
+        timer = undefined
+      }
+    },
+
     "chat.message": async ({ sessionID }) => {
       try {
+        track(sessionID)
         const count = pendingCount(sessionID)
         if (count > 0) {
           pendingPluginPrompts.set(sessionID, { count: count - 1, at: Date.now() })
@@ -231,13 +351,16 @@ export const server: Plugin = async (input, options) => {
           hash: tool.schema.string().optional().describe("Stable message hash to ack."),
           header: tool.schema.string().optional().describe("Message header line to ack (case-insensitive)."),
         },
-        async execute(args) {
+        async execute(args, ctx) {
           const project = args.project ?? cfg.project
           if (!isSafeRecipient(project)) {
             return { title: "mailbox_ack", output: `Invalid project name "${project}": must be lowercase kebab-case.` }
           }
           const file = mailboxFile(cfg.mailboxDir, project)
           const result = ackMessage({ file, hash: args.hash, header: args.header })
+          // An ack is progress: it restores the auto-handling budget so a
+          // backlog can drain one message per wake instead of stalling at the cap.
+          if (result.changed) restoreBudget(ctx.sessionID)
           switch (result.reason) {
             case "not-found":
               return { title: "mailbox_ack", output: `No matching message found in ${project}.` }

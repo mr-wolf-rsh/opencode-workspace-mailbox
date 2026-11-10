@@ -93,7 +93,11 @@ export function ackMessage(req: AckRequest): AckResult {
   if (message.status === "DONE") return { changed: false, message, reason: "already-done" }
   if (message.statusStart < 0 || message.statusEnd < 0) return { changed: false, reason: "not-found" }
 
-  const next = text.slice(0, message.statusStart) + "DONE" + text.slice(message.statusEnd)
+  // Replace the whole status-line content, not just the first word: real
+  // messages carry annotations like `OPEN (confirm one detail)` and flipping the
+  // token alone would leave a nonsensical `DONE (confirm one detail)`.
+  const lineEnd = message.statusLineEnd >= message.statusEnd ? message.statusLineEnd : message.statusEnd
+  const next = text.slice(0, message.statusStart) + "DONE" + text.slice(lineEnd)
   writeFileSync(req.file, next, "utf8")
 
   const updated = parseMailbox(next).find((m) => m.hash === message.hash) ?? message

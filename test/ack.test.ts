@@ -47,6 +47,28 @@ describe("ackMessage", () => {
     expect(afterMsgs[0].body).toBe("body one")
   })
 
+  it("replaces the whole annotated status line, keeping the rest untouched", () => {
+    const annotated =
+      "### 2026-11-10 — from workspace → to bar\n" +
+      "**Status:** OPEN (confirm one copy detail, then reply)\n" +
+      "**Topic:** annotated\n" +
+      "body\n"
+    fs.writeFileSync(file, annotated, "utf8")
+    const target = parseMailbox(annotated)[0]
+
+    const result = ackMessage({ file, hash: target.hash })
+    expect(result.changed).toBe(true)
+
+    const after = fs.readFileSync(file, "utf8")
+    expect(after).toBe(
+      "### 2026-11-10 — from workspace → to bar\n" +
+        "**Status:** DONE\n" +
+        "**Topic:** annotated\n" +
+        "body\n",
+    )
+    expect(after.slice(0, target.statusStart)).toBe(annotated.slice(0, target.statusStart))
+  })
+
   it("acks by header (case-insensitive)", () => {
     const result = ackMessage({ file, header: "2026-11-09 10:01 — FROM baz → TO qux" })
     expect(result.changed).toBe(true)

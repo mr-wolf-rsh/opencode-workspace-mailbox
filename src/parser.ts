@@ -11,6 +11,8 @@ export type MailboxMessage = {
   end: number
   statusStart: number
   statusEnd: number
+  /** Char offset of the end of the status line's content (before its line ending); -1 if absent. */
+  statusLineEnd: number
   hash: string
 }
 
@@ -90,7 +92,7 @@ export function parseMailbox(text: string): MailboxMessage[] {
 
     const hash = messageHash({ header, topic, body })
 
-    messages.push({ header, from, to, status, topic, body, start, end, statusStart, statusEnd, hash })
+    messages.push({ header, from, to, status, topic, body, start, end, statusStart, statusEnd, statusLineEnd, hash })
   }
 
   return messages

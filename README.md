@@ -30,7 +30,10 @@ Add the package to `opencode.json`:
 ```jsonc
 {
   "plugin": [
-    ["opencode-mailbox", { "mailboxDir": "D:\\LABS\\absolute-winners\\handoffs" }]
+    ["opencode-mailbox", {
+      "mailboxDir": "D:\\LABS\\absolute-winners\\handoffs",
+      "wake": true
+    }]
   ]
 }
 ```
@@ -53,11 +56,32 @@ Point `mailboxDir` at the workspace handoff directory. Each project then owns on
 | Option         | Default                          | Description                                                        |
 | -------------- | -------------------------------- | ------------------------------------------------------------------ |
 | `mailboxDir`   | `<directory>/handoffs`           | Directory holding `<project>.md` mailbox files.                    |
-| `project`      | `basename(directory)`, kebab-cased | This instance's project name (lowercase kebab-case).          |
-| `maxAutoRounds`| `2`                              | Auto-prompts per human turn, clamped to `0..20`.                   |
+| `project`      | resolved per session (see below) | Explicit override of this instance's mailbox identity.             |
+| `maxAutoRounds`| `2`                              | Auto-prompts in a row with no progress, clamped to `0..20`.        |
 | `cooldownMs`   | `30000`                          | Minimum gap between auto-prompts (and notices).                    |
 | `enabled`      | `true`                           | Master switch.                                                     |
+| `wake`         | `false`                          | Poll the mailbox and wake an idle session on a new message.        |
+| `pollMs`       | `10000`                          | Wake poll interval, clamped to `100..600000`.                      |
 | `stateFile`    | `<directory>/.atl/mailbox-state.json` | Persisted dedupe/round state (must stay inside the project). |
+
+## Which project am I?
+
+Identity is resolved **per session**, so one global config serves every repo:
+
+1. `project` set in the options → use it verbatim.
+2. `mailboxDir` is configured and lives **inside** the session directory → this session is the
+   parent, so `project` is `workspace`.
+3. Otherwise → the session directory's basename, kebab-cased.
+
+For a workspace where the parent is `D:\LABS\absolute-winners` and children live inside it:
+
+| Session opened at | Reads/writes |
+|---|---|
+| `D:\LABS\absolute-winners` | `handoffs\workspace.md` |
+| `D:\LABS\absolute-winners\absolute-scrapers` | `handoffs\absolute-scrapers.md` |
+
+The containment rule only applies to an explicitly configured `mailboxDir`, so the per-project
+default (`<directory>/handoffs`) never turns every project into the parent.
 
 ## Mailbox format
 
@@ -76,11 +100,16 @@ Body...
 
 - **Idle detection**: on `session.idle`, read the project's mailbox and select
   `OPEN` messages.
+- **Wake (opt-in)**: with `"wake": true`, poll the mailbox every `pollMs` and
+  prompt the most recently active session that is not mid-turn. This is what
+  makes a cross-project message arrive in an already-idle session — an idle
+  *transition* never fires again on its own.
 - **One prompt per message hash**: each message has a stable hash
   (header + topic + body); a given hash is prompted once, persisted across
   restarts.
-- **Round cap**: at most `maxAutoRounds` auto-prompts per human turn; after that
-  a one-line notice is surfaced instead (a toast, deduped per message set).
+- **Round cap**: at most `maxAutoRounds` auto-prompts in a row without progress;
+  after that a one-line notice is surfaced instead (a toast, deduped per message
+  set). An inbox that drains, or an `mailbox_ack`, restores the budget.
 - **Cooldown**: at least `cooldownMs` between auto-prompts.
 - **Own-write suppression**: messages the plugin appends via `mailbox_send` are
   never prompted.
@@ -116,9 +145,12 @@ Body...
 
 ## Limitations
 
-- Only runs while a session is open in that project.
+- Only runs while a session is open in that project — a closed session picks up
+  the message when it is next opened.
 - Scoped to one project per plugin instance (no cross-project session
-  activation).
+  activation); identity is resolved per session, not per config.
+- `wake` spends tokens with nobody watching, at the pace messages arrive. Leave
+  it off if you prefer idle-only delivery.
 - Message bodies are data only; they are never executed.
 - New recipient files are not registered in `handoffs/README.md`.
 

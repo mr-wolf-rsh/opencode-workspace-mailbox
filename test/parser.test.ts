@@ -77,6 +77,16 @@ describe("parseMailbox", () => {
     const m = parseMailbox(text)[0]
     expect(m.statusStart).toBeGreaterThanOrEqual(0)
     expect(text.slice(m.statusStart, m.statusEnd)).toBe("OPEN")
+    expect(text.slice(m.statusStart, m.statusLineEnd)).toBe("OPEN")
+  })
+
+  it("keeps the status token but exposes the whole annotated status line", () => {
+    const text =
+      "### 2026-11-10 — from workspace → to b\n**Status:** OPEN (confirm one detail)\n**Topic:** t\nbody\n"
+    const m = parseMailbox(text)[0]
+    expect(m.status).toBe("OPEN")
+    expect(text.slice(m.statusStart, m.statusEnd)).toBe("OPEN")
+    expect(text.slice(m.statusStart, m.statusLineEnd)).toBe("OPEN (confirm one detail)")
   })
 
   it("ignores a `###` line that is not a message header", () => {

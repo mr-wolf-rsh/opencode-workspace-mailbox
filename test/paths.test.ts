@@ -88,4 +88,36 @@ describe("normalizeConfig", () => {
     const cfg = normalizeConfig({}, path.join(base, "My.Project"))
     expect(cfg.project).toBe("my-project")
   })
+
+  it("treats a session whose directory contains the shared mailboxDir as the parent", () => {
+    const cfg = normalizeConfig({ mailboxDir: path.join(base, "handoffs") }, base)
+    expect(cfg.project).toBe("workspace")
+  })
+
+  it("identifies a nested child session by its own directory name", () => {
+    const child = path.join(base, "absolute-scrapers")
+    const cfg = normalizeConfig({ mailboxDir: path.join(base, "handoffs") }, child)
+    expect(cfg.project).toBe("absolute-scrapers")
+  })
+
+  it("does not turn every project into the parent when mailboxDir is left to its default", () => {
+    const cfg = normalizeConfig({}, path.join(base, "my-project"))
+    expect(cfg.project).toBe("my-project")
+  })
+
+  it("lets an explicit project override identity resolution", () => {
+    const cfg = normalizeConfig(
+      { mailboxDir: path.join(base, "handoffs"), project: "workspace" },
+      path.join(base, "child"),
+    )
+    expect(cfg.project).toBe("workspace")
+  })
+
+  it("defaults wake off, polls every 10s, and clamps pollMs", () => {
+    const cfg = normalizeConfig({}, base)
+    expect(cfg.wake).toBe(false)
+    expect(cfg.pollMs).toBe(10000)
+    expect(normalizeConfig({ wake: true, pollMs: 10 }, base).pollMs).toBe(100)
+    expect(normalizeConfig({ wake: true, pollMs: 10_000_000 }, base).pollMs).toBe(600000)
+  })
 })
