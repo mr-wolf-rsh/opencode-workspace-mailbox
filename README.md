@@ -1,4 +1,4 @@
-# opencode-mailbox
+# opencode-workspace-mailbox
 
 A plugin-only package that makes an OpenCode session aware of its per-project
 mailbox and handles `OPEN` handoff messages automatically — with loop guards.
@@ -30,7 +30,7 @@ Add the package to `opencode.json`:
 ```jsonc
 {
   "plugin": [
-    ["opencode-mailbox", {
+    ["opencode-workspace-mailbox", {
       "mailboxDir": "D:\\LABS\\absolute-winners\\handoffs",
       "wake": true
     }]

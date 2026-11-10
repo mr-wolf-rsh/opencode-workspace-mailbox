@@ -18,7 +18,7 @@ import { buildCapNotice, buildIdlePrompt } from "./prompt.js"
 import { emptyState, StateStore, type MailboxState, type SessionState } from "./state.js"
 
 /**
- * opencode-mailbox plugin entry — makes a session aware of its per-project
+ * opencode-workspace-mailbox plugin entry — makes a session aware of its per-project
  * mailbox and auto-handles OPEN messages on idle, with loop guards.
  *
  * On the `session.idle` event we read the project's mailbox file, find OPEN
@@ -69,7 +69,7 @@ export const server: Plugin = async (input, options) => {
     promise.catch((error) => {
       const remaining = pendingCount(sessionID)
       if (remaining > 0) pendingPluginPrompts.set(sessionID, { count: remaining - 1, at: Date.now() })
-      console.error(`[opencode-mailbox] prompt dispatch failed: ${String(error)}`)
+      console.error(`[opencode-workspace-mailbox] prompt dispatch failed: ${String(error)}`)
     })
   }
 
@@ -182,7 +182,7 @@ export const server: Plugin = async (input, options) => {
     try {
       await consider(sessionID, "poll")
     } catch (error) {
-      console.error(`[opencode-mailbox] poll error: ${String(error)}`)
+      console.error(`[opencode-workspace-mailbox] poll error: ${String(error)}`)
     }
   }
 
@@ -246,7 +246,7 @@ export const server: Plugin = async (input, options) => {
           if (info?.id && sameDirectory(info.directory)) track(info.id)
         }
       } catch (error) {
-        console.error(`[opencode-mailbox] event handler error: ${String(error)}`)
+        console.error(`[opencode-workspace-mailbox] event handler error: ${String(error)}`)
       }
     },
 
@@ -269,7 +269,7 @@ export const server: Plugin = async (input, options) => {
         state.sessions[sessionID] = { autoRounds: 0, lastPromptAt: 0 }
         store.write(state)
       } catch (error) {
-        console.error(`[opencode-mailbox] chat.message handler error: ${String(error)}`)
+        console.error(`[opencode-workspace-mailbox] chat.message handler error: ${String(error)}`)
       }
     },
 
@@ -415,6 +415,6 @@ export type {
 }
 
 export default {
-  id: "opencode-mailbox",
+  id: "opencode-workspace-mailbox",
   server,
 }
