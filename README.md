@@ -31,7 +31,7 @@ Add the package to `opencode.json`:
 {
   "plugin": [
     ["opencode-workspace-mailbox", {
-      "mailboxDir": "D:\\LABS\\absolute-winners\\handoffs",
+      "mailboxDir": "D:\\WORKSHOP\\absolute-labs-studio\\handoffs",
       "wake": true
     }]
   ]
@@ -43,7 +43,7 @@ Local path variant during development:
 ```jsonc
 {
   "plugin": [
-    ["D:\\LABS\\opencode-mailbox", { "mailboxDir": "D:\\LABS\\absolute-winners\\handoffs" }]
+    ["D:\\WORKSHOP\\mr-wolf-rsh\\tools\\opencode-workspace-mailbox", { "mailboxDir": "D:\\WORKSHOP\\absolute-labs-studio\\handoffs" }]
   ]
 }
 ```
@@ -62,6 +62,10 @@ Point `mailboxDir` at the workspace handoff directory. Each project then owns on
 | `enabled`      | `true`                           | Master switch.                                                     |
 | `wake`         | `false`                          | Poll the mailbox and wake an idle session on a new message.        |
 | `pollMs`       | `10000`                          | Wake poll interval, clamped to `100..600000`.                      |
+| `spawnOnSend`  | `false`                          | Create a session in the recipient's directory when sending.        |
+| `spawnCooldownMs` | `60000`                       | Minimum gap between spawns.                                        |
+| `maxSpawnsPerTurn` | `1`                           | Spawns allowed per human turn, clamped to `0..10`.                 |
+| `projectDirs`  | `{}`                             | Explicit `{ "<recipient>": "<directory>" }` map for spawning.      |
 | `stateFile`    | `<directory>/.atl/mailbox-state.json` | Persisted dedupe/round state (must stay inside the project). |
 
 ## Which project am I?
@@ -73,12 +77,12 @@ Identity is resolved **per session**, so one global config serves every repo:
    parent, so `project` is `workspace`.
 3. Otherwise → the session directory's basename, kebab-cased.
 
-For a workspace where the parent is `D:\LABS\absolute-winners` and children live inside it:
+For a workspace where the parent is `D:\WORKSHOP\absolute-labs-studio` and children live inside it:
 
 | Session opened at | Reads/writes |
 |---|---|
-| `D:\LABS\absolute-winners` | `handoffs\workspace.md` |
-| `D:\LABS\absolute-winners\absolute-scrapers` | `handoffs\absolute-scrapers.md` |
+| `D:\WORKSHOP\absolute-labs-studio` | `handoffs\workspace.md` |
+| `D:\WORKSHOP\absolute-labs-studio\absolute-scrapers` | `handoffs\absolute-scrapers.md` |
 
 The containment rule only applies to an explicitly configured `mailboxDir`, so the per-project
 default (`<directory>/handoffs`) never turns every project into the parent.
@@ -95,6 +99,33 @@ flipping a message's `**Status:**` line to `DONE`.
 **Topic:** one-line subject
 Body...
 ```
+
+## Spawn on send
+
+With `"spawnOnSend": true`, `mailbox_send` also creates a session in the recipient's project
+directory (SDK `session.create` with `query.directory`), titled `mailbox: <recipient>`.
+
+**Directory resolution**, in order:
+
+1. `projectDirs[recipient]`, if configured.
+2. `workspace` → the directory containing `mailboxDir`.
+3. A sibling of `mailboxDir` named after the recipient, if it exists.
+
+If none resolves, the send still succeeds (the message is appended) and the tool reports why no
+session was created. It never guesses a directory.
+
+**Guards** (why this cannot loop):
+
+- `spawnOnSend` is off by default.
+- A session whose title starts with `mailbox:` never spawns — the cascade stops at depth one, and
+  the prefix is visible to every plugin instance, not just the one that created it.
+- One spawn per message hash, a cooldown, and a per-turn cap.
+- No spawn when a session already exists in the recipient directory, or when the recipient is the
+  sender's own project.
+
+**What spawning does not do:** it creates a server-side session; it does not attach a terminal
+window. The recipient still needs a plugin instance serving that directory for the wake path to
+deliver the turn, and a headless session that hits a permission prompt has nobody to answer it.
 
 ## Behaviour
 
@@ -124,17 +155,19 @@ Body...
 ## Loop guards
 
 - Dedupe by stable hash (persisted).
-- Max auto-rounds per human turn.
+- Max auto-rounds per human turn, restored by an ack or a drained inbox.
 - Never react to the plugin's own writes.
 - Cooldown between prompts.
 - Idempotent ack (already-`DONE` is a no-op, not an error).
+- Spawns: opt-in, one per message, cooldown, per-turn cap, no spawn from a `mailbox:` session, and
+  no spawn when the recipient already has a session.
 
 ## Safety
 
 - **Append-only mailbox.** `mailbox_send` only appends; it never rewrites, reorders, or deletes.
-- **Minimal ack diff.** `mailbox_ack` replaces only the bytes of the `**Status:**` token
-  (`OPEN` → `DONE`). Every other byte — spacing, line endings, bodies — is preserved, and the tests
-  assert exactly that.
+- **Minimal ack diff.** `mailbox_ack` replaces only the status line's content
+  (`OPEN (annotations)` → `DONE`). Every other byte — spacing elsewhere, line endings, bodies — is
+  preserved, and the tests assert exactly that.
 - **Path containment.** Recipients must be lowercase kebab-case and resolved paths must stay inside
   `mailboxDir`; traversal (`..`, separators, absolute paths) is rejected. The state file must
   resolve inside the project directory.
@@ -145,10 +178,11 @@ Body...
 
 ## Limitations
 
-- Only runs while a session is open in that project — a closed session picks up
-  the message when it is next opened.
-- Scoped to one project per plugin instance (no cross-project session
-  activation); identity is resolved per session, not per config.
+- Delivery needs a plugin instance serving the recipient directory. With no session open there,
+  the message waits in the file; `spawnOnSend` creates a session but cannot attach a terminal
+  window to it.
+- Scoped to one project per plugin instance (no cross-project session activation beyond
+  `session.create`); identity is resolved per session, not per config.
 - `wake` spends tokens with nobody watching, at the pace messages arrive. Leave
   it off if you prefer idle-only delivery.
 - Message bodies are data only; they are never executed.

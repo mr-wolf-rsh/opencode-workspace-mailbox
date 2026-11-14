@@ -10,6 +10,10 @@ export type MailboxConfig = {
   stateFile?: string | null
   wake?: boolean
   pollMs?: number
+  spawnOnSend?: boolean
+  spawnCooldownMs?: number
+  maxSpawnsPerTurn?: number
+  projectDirs?: Record<string, string>
 }
 
 export type NormalizedConfig = {
@@ -21,6 +25,10 @@ export type NormalizedConfig = {
   stateFile: string
   wake: boolean
   pollMs: number
+  spawnOnSend: boolean
+  spawnCooldownMs: number
+  maxSpawnsPerTurn: number
+  projectDirs: Record<string, string>
 }
 
 function clampInt(value: unknown, def: number, min: number, max: number): number {
@@ -82,6 +90,17 @@ export function normalizeConfig(
   const enabled = typeof opts.enabled === "boolean" ? opts.enabled : true
   const wake = typeof opts.wake === "boolean" ? opts.wake : false
   const pollMs = clampInt(opts.pollMs, 10000, 100, 600000)
+  const spawnOnSend = typeof opts.spawnOnSend === "boolean" ? opts.spawnOnSend : false
+  const spawnCooldownMs = nonNegativeInt(opts.spawnCooldownMs, 60000)
+  const maxSpawnsPerTurn = clampInt(opts.maxSpawnsPerTurn, 1, 0, 10)
+  const projectDirs: Record<string, string> = {}
+  if (opts.projectDirs && typeof opts.projectDirs === "object" && !Array.isArray(opts.projectDirs)) {
+    for (const [key, value] of Object.entries(opts.projectDirs as Record<string, unknown>)) {
+      if (typeof value === "string" && value.length > 0 && isSafeRecipient(key)) {
+        projectDirs[key] = path.resolve(value)
+      }
+    }
+  }
 
   const rawStateFile =
     typeof opts.stateFile === "string" && opts.stateFile.length > 0
@@ -89,5 +108,18 @@ export function normalizeConfig(
       : path.join(directory, ".atl", "mailbox-state.json")
   const stateFile = assertInside(directory, rawStateFile, "stateFile")
 
-  return { mailboxDir, project, maxAutoRounds, cooldownMs, enabled, stateFile, wake, pollMs }
+  return {
+    mailboxDir,
+    project,
+    maxAutoRounds,
+    cooldownMs,
+    enabled,
+    stateFile,
+    wake,
+    pollMs,
+    spawnOnSend,
+    spawnCooldownMs,
+    maxSpawnsPerTurn,
+    projectDirs,
+  }
 }

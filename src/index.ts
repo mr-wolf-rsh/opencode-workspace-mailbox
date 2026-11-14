@@ -1,4 +1,5 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
+import { existsSync } from "node:fs"
 import path from "node:path"
 import { normalizeConfig, type MailboxConfig, type NormalizedConfig } from "./config.js"
 import { messageHash, normalizeForHash } from "./hash.js"
@@ -86,14 +87,18 @@ export const server: Plugin = async (input, options) => {
   // Session registry: the wake path needs a session ID to prompt, and Events
   // alone do not guarantee one for a session that never had a turn.
   // ---------------------------------------------------------------------------
-  type SessionTrack = { lastSeen: number; busy: boolean }
+  type SessionTrack = { lastSeen: number; busy: boolean; title?: string }
   const sessions = new Map<string, SessionTrack>()
 
-  function track(sessionID: string, busy?: boolean): void {
+  /** Prefix applied to every session this plugin creates, so other instances can spot it. */
+  const SPAWN_TITLE_PREFIX = "mailbox:"
+
+  function track(sessionID: string, busy?: boolean, title?: string): void {
     if (!sessionID) return
     const entry = sessions.get(sessionID) ?? { lastSeen: 0, busy: false }
     entry.lastSeen = Date.now()
     if (busy !== undefined) entry.busy = busy
+    if (title) entry.title = title
     sessions.set(sessionID, entry)
   }
 
@@ -213,12 +218,12 @@ export const server: Plugin = async (input, options) => {
     try {
       const result = await client.session.list({ query: { directory: input.directory } })
       const list = (result as {
-        data?: Array<{ id?: string; directory?: string; time?: { updated?: number } }>
+        data?: Array<{ id?: string; directory?: string; title?: string; time?: { updated?: number } }>
       }).data
       for (const entry of list ?? []) {
         if (!entry?.id || !sameDirectory(entry.directory)) continue
         if (sessions.has(entry.id)) continue
-        sessions.set(entry.id, { lastSeen: entry.time?.updated ?? 0, busy: false })
+        sessions.set(entry.id, { lastSeen: entry.time?.updated ?? 0, busy: false, title: entry.title })
       }
     } catch {
       // Session registry unavailable — chat.message and idle events still
@@ -227,6 +232,96 @@ export const server: Plugin = async (input, options) => {
   }
 
   void seedSessions()
+
+  /**
+   * Recipient directory for spawn-on-send: an explicit `projectDirs` entry first,
+   * then the workspace root itself for `workspace`, then a sibling of `mailboxDir`.
+   * Anything unresolvable is a documented no-op, never a guess.
+   */
+  function resolveProjectDir(to: string): string | undefined {
+    const mapped = cfg.projectDirs[to]
+    if (mapped) return mapped
+    const root = path.dirname(path.resolve(cfg.mailboxDir))
+    if (to === "workspace") return existsSync(root) ? root : undefined
+    const sibling = path.join(root, to)
+    return existsSync(sibling) ? sibling : undefined
+  }
+
+  async function findSession(directory: string): Promise<string | undefined> {
+    try {
+      const result = await client.session.list({ query: { directory } })
+      const list = (result as {
+        data?: Array<{ id?: string; directory?: string; time?: { updated?: number } }>
+      }).data ?? []
+      const wanted = path.resolve(directory)
+      const candidates = list.filter(
+        (entry) => entry.id && entry.directory && path.relative(wanted, path.resolve(entry.directory)) === "",
+      )
+      if (candidates.length === 0) return undefined
+      candidates.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))
+      return candidates[0].id
+    } catch {
+      return undefined
+    }
+  }
+
+  type SpawnOutcome = { spawned: boolean; detail: string }
+
+  /**
+   * Create a session in the recipient's directory. Guards, in order: feature
+   * flag, self-send, cascade (a session this plugin spawned never spawns),
+   * duplicate message, cooldown, per-turn cap, then directory resolution.
+   */
+  async function maybeSpawn(sessionID: string, to: string, hash: string): Promise<SpawnOutcome> {
+    if (!cfg.spawnOnSend) return { spawned: false, detail: "spawnOnSend is off" }
+    if (to === cfg.project) return { spawned: false, detail: "recipient is this project" }
+
+    const state = store.read()
+    const currentTitle = sessions.get(sessionID)?.title
+    if (currentTitle?.startsWith(SPAWN_TITLE_PREFIX) || state.spawnedSessions.includes(sessionID)) {
+      return { spawned: false, detail: "loop guard: this session was spawned" }
+    }
+    if (state.spawnedHashes.includes(hash)) {
+      return { spawned: false, detail: "already spawned for this message" }
+    }
+
+    const now = Date.now()
+    if (now - (state.lastSpawnAt ?? 0) < cfg.spawnCooldownMs) {
+      return { spawned: false, detail: `spawn cooldown (${cfg.spawnCooldownMs} ms)` }
+    }
+    const session = state.sessions[sessionID] ?? { autoRounds: 0, lastPromptAt: 0 }
+    if ((session.spawnsThisTurn ?? 0) >= cfg.maxSpawnsPerTurn) {
+      return { spawned: false, detail: `max ${cfg.maxSpawnsPerTurn} spawn(s) per turn reached` }
+    }
+
+    const directory = resolveProjectDir(to)
+    if (!directory) {
+      return { spawned: false, detail: `no directory known for "${to}" (set projectDirs)` }
+    }
+
+    const existing = await findSession(directory)
+    if (existing) return { spawned: false, detail: `session already exists (${existing})` }
+
+    try {
+      const created = await client.session.create({
+        query: { directory },
+        body: { title: `${SPAWN_TITLE_PREFIX} ${to}` },
+      })
+      const id = (created as { data?: { id?: string } }).data?.id
+      if (!id) return { spawned: false, detail: "session.create returned no id" }
+
+      session.spawnsThisTurn = (session.spawnsThisTurn ?? 0) + 1
+      state.sessions[sessionID] = session
+      state.lastSpawnAt = now
+      recordHashes(state.spawnedSessions, [id])
+      recordHashes(state.spawnedHashes, [hash])
+      store.write(state)
+      track(id, false, `${SPAWN_TITLE_PREFIX} ${to}`)
+      return { spawned: true, detail: `spawned session ${id} in ${directory}` }
+    } catch (error) {
+      return { spawned: false, detail: `session.create failed: ${String(error)}` }
+    }
+  }
 
   return {
     event: async ({ event }) => {
@@ -242,8 +337,8 @@ export const server: Plugin = async (input, options) => {
           return
         }
         if (event.type === "session.created" || event.type === "session.updated") {
-          const info = (event.properties as { info?: { id?: string; directory?: string } }).info
-          if (info?.id && sameDirectory(info.directory)) track(info.id)
+          const info = (event.properties as { info?: { id?: string; directory?: string; title?: string } }).info
+          if (info?.id && sameDirectory(info.directory)) track(info.id, undefined, info.title)
         }
       } catch (error) {
         console.error(`[opencode-workspace-mailbox] event handler error: ${String(error)}`)
@@ -316,7 +411,7 @@ export const server: Plugin = async (input, options) => {
             .optional()
             .describe("Initial status. Defaults to OPEN."),
         },
-        async execute(args) {
+        async execute(args, ctx) {
           try {
             const result = sendMessage({
               mailboxDir: cfg.mailboxDir,
@@ -329,9 +424,12 @@ export const server: Plugin = async (input, options) => {
             store.update((state: MailboxState) => {
               recordHashes(state.ownWrites, [result.hash])
             })
+            const spawn = await maybeSpawn(ctx.sessionID, args.to, result.hash)
+            const suffix = cfg.spawnOnSend ? ` Spawn: ${spawn.detail}.` : ""
             return {
               title: "mailbox_send",
-              output: `Appended message to ${args.to} (hash ${result.hash}) in ${result.file}.`,
+              output: `Appended message to ${args.to} (hash ${result.hash}) in ${result.file}.${suffix}`,
+              metadata: { hash: result.hash, spawned: spawn.spawned },
             }
           } catch (error) {
             return { title: "mailbox_send", output: `Failed to send message: ${String(error)}` }

@@ -6,18 +6,24 @@ export type SessionState = {
   lastPromptAt: number
   lastNoticeAt?: number
   noticeKey?: string
+  spawnsThisTurn?: number
 }
 export type MailboxState = {
   version: 1
   prompted: string[]
   ownWrites: string[]
   sessions: Record<string, SessionState>
+  /** Session ids this plugin created (spawn-on-send). */
+  spawnedSessions: string[]
+  /** Message hashes that already triggered a spawn. */
+  spawnedHashes: string[]
+  lastSpawnAt?: number
 }
 
 const MAX_ENTRIES = 500
 
 export function emptyState(): MailboxState {
-  return { version: 1, prompted: [], ownWrites: [], sessions: {} }
+  return { version: 1, prompted: [], ownWrites: [], sessions: {}, spawnedSessions: [], spawnedHashes: [] }
 }
 
 function finiteInt(value: unknown): number {
@@ -49,6 +55,9 @@ function coerceSession(value: unknown): SessionState {
   if (typeof obj.noticeKey === "string") {
     session.noticeKey = obj.noticeKey
   }
+  if (typeof obj.spawnsThisTurn === "number" && Number.isFinite(obj.spawnsThisTurn)) {
+    session.spawnsThisTurn = Math.max(0, Math.floor(obj.spawnsThisTurn))
+  }
   return session
 }
 
@@ -61,7 +70,17 @@ function coerce(value: unknown): MailboxState {
       sessions[key] = coerceSession(entry)
     }
   }
-  return { version: 1, prompted: asStringArray(obj.prompted), ownWrites: asStringArray(obj.ownWrites), sessions }
+  return {
+    version: 1,
+    prompted: asStringArray(obj.prompted),
+    ownWrites: asStringArray(obj.ownWrites),
+    sessions,
+    spawnedSessions: asStringArray(obj.spawnedSessions),
+    spawnedHashes: asStringArray(obj.spawnedHashes),
+    ...(typeof obj.lastSpawnAt === "number" && Number.isFinite(obj.lastSpawnAt)
+      ? { lastSpawnAt: obj.lastSpawnAt }
+      : {}),
+  }
 }
 
 export class StateStore {
