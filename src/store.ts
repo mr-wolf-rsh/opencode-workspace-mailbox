@@ -3,6 +3,7 @@ import path from "node:path"
 import { ackMessage, readMailbox, sendMessage, type AckResult, type SendResult } from "./mailbox.js"
 import { mailboxFile } from "./paths.js"
 import { isOpen, messageTime, parseMailbox, type MailboxMessage } from "./parser.js"
+import { withFileLock } from "./lock.js"
 
 export type MailboxFilter = {
   status?: string
@@ -98,20 +99,24 @@ export function createFileStore(dir: string, options: FileStoreOptions = {}): Ma
       return load(project)
     },
     append(project: string, input: AppendInput): SendResult {
-      const result = sendMessage({
+      const result = withFileLock(fileFor(project), () =>
+        sendMessage({
         mailboxDir: root,
         to: project,
         from: input.from,
         topic: input.topic,
         body: input.body,
         status: input.status,
-        now: input.now,
-      })
+          now: input.now,
+        }),
+      )
       invalidate(project)
       return result
     },
     ack(project: string, target: { hash?: string; header?: string }): AckResult {
-      const result = ackMessage({ file: fileFor(project), hash: target.hash, header: target.header })
+      const result = withFileLock(fileFor(project), () =>
+        ackMessage({ file: fileFor(project), hash: target.hash, header: target.header }),
+      )
       if (result.changed) invalidate(project)
       return result
     },
@@ -130,51 +135,59 @@ export function createFileStore(dir: string, options: FileStoreOptions = {}): Ma
     },
     importMessages(project: string, messages: MailboxMessage[]): number {
       if (messages.length === 0) return 0
-      const target = fileFor(project)
-      mkdirSync(path.dirname(target), { recursive: true })
-      if (!existsSync(target)) {
-        writeFileSync(
-          target,
-          `# ${project} mailbox\n\nMessages addressed to \`${project}\`. Append-only.\n`,
-          "utf8",
-        )
-      }
-      let endsWithNewline = readFileSync(target, "utf8").endsWith("\n")
-      for (const message of messages) {
-        const block = blockOf(message)
-        appendFileSync(target, `${endsWithNewline ? "\n" : "\n\n"}${block}`, "utf8")
-        endsWithNewline = true
-      }
-      invalidate(project)
-      return messages.length
+      return withFileLock(fileFor(project), () => {
+        const target = fileFor(project)
+        mkdirSync(path.dirname(target), { recursive: true })
+        if (!existsSync(target)) {
+          writeFileSync(
+            target,
+            `# ${project} mailbox\n\nMessages addressed to \`${project}\`. Append-only.\n`,
+            "utf8",
+          )
+        }
+        let endsWithNewline = readFileSync(target, "utf8").endsWith("\n")
+        for (const message of messages) {
+          const block = blockOf(message)
+          appendFileSync(target, `${endsWithNewline ? "\n" : "\n\n"}${block}`, "utf8")
+          endsWithNewline = true
+        }
+        invalidate(project)
+        return messages.length
+      })
     },
     archive(project: string, cutoffMs: number): number {
-      const messages = load(project)
-      const keep: MailboxMessage[] = []
-      const move: MailboxMessage[] = []
-      for (const message of messages) {
-        if (message.status === "DONE" && messageTime(message) > 0 && messageTime(message) < cutoffMs) {
-          move.push(message)
-        } else {
-          keep.push(message)
+      return withFileLock(fileFor(project), () => {
+        const messages = load(project)
+        const keep: MailboxMessage[] = []
+        const move: MailboxMessage[] = []
+        for (const message of messages) {
+          if (
+            message.status === "DONE" &&
+            messageTime(message) > 0 &&
+            messageTime(message) < cutoffMs
+          ) {
+            move.push(message)
+          } else {
+            keep.push(message)
+          }
         }
-      }
-      if (move.length === 0) return 0
+        if (move.length === 0) return 0
 
-      const target = fileFor(project)
-      const header = `# ${project} mailbox\n\nMessages addressed to \`${project}\`. Append-only.\n`
-      const kept = keep.map(blockOf).join("\n")
-      writeFileSync(target, keep.length > 0 ? `${header}\n${kept}` : header, "utf8")
+        const target = fileFor(project)
+        const header = `# ${project} mailbox\n\nMessages addressed to \`${project}\`. Append-only.\n`
+        const kept = keep.map(blockOf).join("\n")
+        writeFileSync(target, keep.length > 0 ? `${header}\n${kept}` : header, "utf8")
 
-      mkdirSync(archiveDir, { recursive: true })
-      const archiveFile = path.join(archiveDir, `${project}.md`)
-      const preamble = existsSync(archiveFile)
-        ? ""
-        : `# ${project} archive\n\nMessages moved out of the active mailbox by retention.\n\n`
-      appendFileSync(archiveFile, preamble + move.map(blockOf).join("\n"), "utf8")
+        mkdirSync(archiveDir, { recursive: true })
+        const archiveFile = path.join(archiveDir, `${project}.md`)
+        const preamble = existsSync(archiveFile)
+          ? ""
+          : `# ${project} archive\n\nMessages moved out of the active mailbox by retention.\n\n`
+        appendFileSync(archiveFile, preamble + move.map(blockOf).join("\n"), "utf8")
 
-      invalidate(project)
-      return move.length
+        invalidate(project)
+        return move.length
+      })
     },
     projects(): string[] {
       if (!existsSync(root)) return []

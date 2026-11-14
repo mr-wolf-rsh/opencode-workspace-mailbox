@@ -1,6 +1,6 @@
 {
   "name": "opencode-workspace-mailbox",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "A per-project mailbox for OpenCode sessions — detect OPEN handoff messages on idle, prompt the agent to handle them, with loop guards",
   "repository": {
     "type": "git",

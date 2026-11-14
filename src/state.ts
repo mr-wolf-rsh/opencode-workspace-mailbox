@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import path from "node:path"
+import { withFileLock } from "./lock.js"
 
 export type SessionState = {
   autoRounds: number
@@ -102,7 +103,12 @@ export class StateStore {
     }
   }
 
+  /** Write under a cross-process lock (two sessions can share one project dir). */
   write(state: MailboxState): void {
+    withFileLock(this.file, () => this.writeUnlocked(state))
+  }
+
+  private writeUnlocked(state: MailboxState): void {
     const clean = coerce(state)
     mkdirSync(path.dirname(this.file), { recursive: true })
     const tmp = `${this.file}.tmp`
@@ -111,9 +117,11 @@ export class StateStore {
   }
 
   update(mutator: (state: MailboxState) => void): MailboxState {
-    const state = this.read()
-    mutator(state)
-    this.write(state)
-    return state
+    return withFileLock(this.file, () => {
+      const state = this.read()
+      mutator(state)
+      this.writeUnlocked(state)
+      return state
+    })
   }
 }
