@@ -4,12 +4,16 @@ function truncate(text: string, max: number): string {
   return text.length > max ? text.slice(0, max) : text
 }
 
-export function buildIdlePrompt(project: string, messages: MailboxMessage[]): string {
+export function buildIdlePrompt(
+  project: string,
+  messages: MailboxMessage[],
+  readInstruction?: string,
+): string {
   const n = messages.length
   const topics = messages.map((m) => `- ${truncate(m.topic || "(no topic)", 120)}`).join("\n")
   return (
     `You have ${n} OPEN mailbox message(s) for this project.\n\n` +
-    `Load the \`workspace-mailbox\` skill, read \`handoffs/${project}.md\`, handle every OPEN message,\n` +
+    `Load the \`workspace-mailbox\` skill, ${readInstruction ?? `read \`handoffs/${project}.md\``}, handle every OPEN message,\n` +
     `flip each one to DONE (use \`mailbox_ack\`), and reply only if a decision is needed.\n\n` +
     `Topics:\n${topics}`
   )
@@ -20,12 +24,16 @@ export function buildCapNotice(project: string, count: number, maxAutoRounds = 2
 }
 
 /** Instruction used when a sender delivers a message into another session. */
-export function buildDeliveryPrompt(from: string, to: string, topic: string, mailboxPath: string): string {
+export function buildDeliveryPrompt(
+  from: string,
+  to: string,
+  topic: string,
+  readInstruction: string,
+): string {
   return (
     `A new mailbox message from ${from} was just delivered to ${to}.\n\n` +
-    `Topic: ${topic}\n` +
-    `File: ${mailboxPath}\n\n` +
-    `Load the \`workspace-mailbox\` skill, read that file, handle this message, ` +
+    `Topic: ${topic}\n\n` +
+    `Load the \`workspace-mailbox\` skill, ${readInstruction}, handle this message, ` +
     `flip it to DONE with \`mailbox_ack\`, and reply with \`mailbox_send\` only if a decision is needed.`
   )
 }

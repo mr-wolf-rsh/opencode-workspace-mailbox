@@ -1,5 +1,5 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { existsSync, readdirSync, type Dirent } from "node:fs"
+import { existsSync, readdirSync, readFileSync, type Dirent } from "node:fs"
 import path from "node:path"
 import { normalizeConfig, type MailboxConfig, type NormalizedConfig } from "./config.js"
 import { discoverTier, routeRecipient, type TierContext } from "./discovery.js"
@@ -17,6 +17,7 @@ import { buildCapNotice, buildDeliveryPrompt, buildIdlePrompt } from "./prompt.j
 import { emptyState, StateStore, type MailboxState, type SessionState } from "./state.js"
 import { createFileStore, type MailboxStore } from "./store.js"
 import { createSqliteStore } from "./sqlite-store.js"
+import { exportStoreIntoFile, importFileIntoStore, missingMessages, statusUpdates } from "./migrate.js"
 
 /**
  * opencode-workspace-mailbox plugin entry — makes a session aware of its per-project
@@ -39,25 +40,40 @@ export const server: Plugin = async (input, options) => {
     ? discoverTier(input.directory, { mailboxDir: cfg.mailboxDir, project: cfg.project })
     : discoverTier(input.directory)
 
-  // One store per mailbox directory; the backend is swappable behind MailboxStore.
+  // One store per backend + directory; the backend is swappable behind MailboxStore.
   const stores = new Map<string, Promise<MailboxStore>>()
 
-  function storeFor(dir: string): Promise<MailboxStore> {
-    const key = path.resolve(dir)
-    let found = stores.get(key)
+  /** Database file for a directory: an explicit sqlitePath only pins the primary mailbox. */
+  function databaseFileFor(dir: string): string {
+    const resolved = path.resolve(dir)
+    if (cfg.sqlitePath && resolved === path.resolve(tier.mailboxDir)) return cfg.sqlitePath
+    return path.join(resolved, ".mailbox.db")
+  }
+
+  function storeForBackend(
+    kind: "file" | "sqlite",
+    dir: string,
+    options: { autoImport?: boolean } = {},
+  ): Promise<MailboxStore> {
+    const resolved = path.resolve(dir)
+    const autoImport = options.autoImport ?? true
+    const cacheKey = `${kind}:${resolved}:${autoImport}`
+    let found = stores.get(cacheKey)
     if (!found) {
       found =
-        cfg.storage === "sqlite"
-          ? createSqliteStore(cfg.sqlitePath ?? path.join(key, ".mailbox.db"), {
-              legacyDir: key,
+        kind === "sqlite"
+          ? createSqliteStore(databaseFileFor(resolved), {
+              legacyDir: resolved,
               mirror: cfg.sqliteMirror,
+              autoImport,
             })
-          : Promise.resolve(createFileStore(key))
-      stores.set(key, found)
+          : Promise.resolve(createFileStore(resolved))
+      stores.set(cacheKey, found)
     }
     return found
   }
 
+  const storeFor = (dir: string): Promise<MailboxStore> => storeForBackend(cfg.storage, dir)
   const own = (): Promise<MailboxStore> => storeFor(tier.mailboxDir)
 
   // Dynamic discovery creates the inboxes a tier is supposed to have.
@@ -204,7 +220,16 @@ export const server: Plugin = async (input, options) => {
     session.noticeKey = undefined
     state.sessions[sessionID] = session
     store.write(state)
-    dispatchPrompt(sessionID, buildIdlePrompt(tier.project, fresh))
+    dispatchPrompt(
+      sessionID,
+      buildIdlePrompt(
+        tier.project,
+        fresh,
+        cfg.storage === "sqlite" && !cfg.sqliteMirror
+          ? `call \`mailbox_read\` for ${tier.project}`
+          : `read \`${mailboxFile(tier.mailboxDir, tier.project)}\``,
+      ),
+    )
   }
 
   /** The most recently active session that is not mid-turn, if any. */
@@ -217,14 +242,19 @@ export const server: Plugin = async (input, options) => {
     return best?.id
   }
 
+  let polling = false
+
   async function poll(): Promise<void> {
-    if (!cfg.enabled) return
+    if (!cfg.enabled || polling) return
     const sessionID = wakeTarget()
     if (!sessionID) return
+    polling = true
     try {
       await consider(sessionID, "poll")
     } catch (error) {
       console.error(`[opencode-workspace-mailbox] poll error: ${String(error)}`)
+    } finally {
+      polling = false
     }
   }
 
@@ -255,10 +285,10 @@ export const server: Plugin = async (input, options) => {
     try {
       const result = await client.session.list({ query: { directory: input.directory } })
       const list = (result as {
-        data?: Array<{ id?: string; directory?: string; title?: string; time?: { updated?: number } }>
+        data?: Array<{ id?: string; directory?: string; parentID?: string; title?: string; time?: { updated?: number } }>
       }).data
       for (const entry of list ?? []) {
-        if (!entry?.id || !sameDirectory(entry.directory)) continue
+        if (!entry?.id || entry.parentID || !sameDirectory(entry.directory)) continue
         if (sessions.has(entry.id)) continue
         sessions.set(entry.id, { lastSeen: entry.time?.updated ?? 0, busy: false, title: entry.title })
       }
@@ -320,11 +350,15 @@ export const server: Plugin = async (input, options) => {
     try {
       const result = await client.session.list({ query: { directory } })
       const list = (result as {
-        data?: Array<{ id?: string; directory?: string; time?: { updated?: number } }>
+        data?: Array<{ id?: string; directory?: string; parentID?: string; time?: { updated?: number } }>
       }).data ?? []
       const wanted = path.resolve(directory)
       const candidates = list.filter(
-        (entry) => entry.id && entry.directory && path.relative(wanted, path.resolve(entry.directory)) === "",
+        (entry) =>
+          entry.id &&
+          entry.directory &&
+          !entry.parentID &&
+          path.relative(wanted, path.resolve(entry.directory)) === "",
       )
       if (candidates.length === 0) return undefined
       candidates.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))
@@ -420,10 +454,15 @@ export const server: Plugin = async (input, options) => {
     }
 
     const route = routeRecipient(to, tier)
+    const mailboxPath = mailboxFile(route.mailboxDir, route.project)
+    const readInstruction =
+      cfg.storage === "sqlite" && !cfg.sqliteMirror
+        ? `call \`mailbox_read\` for ${to}`
+        : `read \`${mailboxPath}\``
     dispatchDelivery(
       targetID,
       directory,
-      buildDeliveryPrompt(tier.project, to, topic, mailboxFile(route.mailboxDir, route.project)),
+      buildDeliveryPrompt(tier.project, to, topic, readInstruction),
     )
 
     session.spawnsThisTurn = (session.spawnsThisTurn ?? 0) + 1
@@ -451,8 +490,8 @@ export const server: Plugin = async (input, options) => {
           return
         }
         if (event.type === "session.created" || event.type === "session.updated") {
-          const info = (event.properties as { info?: { id?: string; directory?: string; title?: string } }).info
-          if (info?.id && sameDirectory(info.directory)) track(info.id, undefined, info.title)
+          const info = (event.properties as { info?: { id?: string; directory?: string; parentID?: string; title?: string } }).info
+          if (info?.id && !info.parentID && sameDirectory(info.directory)) track(info.id, undefined, info.title)
         }
       } catch (error) {
         console.error(`[opencode-workspace-mailbox] event handler error: ${String(error)}`)
@@ -568,6 +607,138 @@ export const server: Plugin = async (input, options) => {
         },
       }),
 
+      mailbox_status: tool({
+        description:
+          "Report the active storage backend, the mailbox location, and per-project message counts " +
+          "for both backends so a migration can be verified before and after.",
+        args: {},
+        async execute() {
+          const route = routeRecipient(tier.project, tier)
+          const activeDb = databaseFileFor(route.mailboxDir)
+          // A status read must not create a database as a side effect.
+          const activeMissing = cfg.storage === "sqlite" && !existsSync(activeDb)
+          const active = activeMissing ? undefined : await storeFor(route.mailboxDir)
+          const otherKind = cfg.storage === "sqlite" ? "file" : "sqlite"
+          const otherDb = databaseFileFor(route.mailboxDir)
+          const otherAvailable = otherKind === "file" ? existsSync(route.mailboxDir) : existsSync(otherDb)
+
+          const describe = (store: MailboxStore): string[] =>
+            store.projects().map((project) => {
+              const all = store.read(project)
+              return `  ${project}: ${all.length} total, ${all.filter(isOpen).length} open`
+            })
+
+          const activeLines = active ? describe(active) : []
+          const lines = [
+            `backend: ${cfg.storage}`,
+            `tier: ${tier.tier}`,
+            `project: ${tier.project}`,
+            `mailboxDir: ${route.mailboxDir}`,
+            `active (${cfg.storage}):`,
+            ...(active
+              ? activeLines.length > 0
+                ? activeLines
+                : ["  (empty)"]
+              : [`  (not created yet: ${activeDb})`]),
+            `other (${otherKind}):`,
+          ]
+          if (!otherAvailable) {
+            lines.push("  (not created yet)")
+          } else {
+            const other = await storeForBackend(otherKind, route.mailboxDir)
+            const otherLines = describe(other)
+            lines.push(...(otherLines.length > 0 ? otherLines : ["  (empty)"]))
+          }
+          return { title: "mailbox_status", output: lines.join("\n") }
+        },
+      }),
+
+      mailbox_migrate: tool({
+        description:
+          "Copy every message between storage backends, idempotently (hash-keyed). `to: \"sqlite\"` " +
+          "imports the markdown files; `to: \"file\"` exports the database rows. Safe to re-run. " +
+          "It does not change the configured `storage`; set that afterwards.",
+        args: {
+          to: tool.schema
+            .enum(["file", "sqlite"])
+            .describe("Target backend to copy the messages into."),
+          project: tool.schema
+            .string()
+            .optional()
+            .describe("Limit to one project. Defaults to every project found."),
+          dryRun: tool.schema
+            .boolean()
+            .optional()
+            .describe("Report what would change without writing anything."),
+        },
+        async execute(args) {
+          const targetKind = args.to
+          const sourceKind = targetKind === "sqlite" ? "file" : "sqlite"
+          const dbFile = databaseFileFor(tier.mailboxDir)
+
+          // A dry run must not create the target: a missing database is simply empty.
+          if (args.dryRun && sourceKind === "sqlite" && !existsSync(dbFile)) {
+            return {
+              title: "mailbox_migrate",
+              output: `No sqlite database at ${dbFile}; nothing to migrate to file.`,
+              metadata: { from: sourceKind, to: targetKind, projects: 0 },
+            }
+          }
+          if (args.dryRun && targetKind === "sqlite" && !existsSync(dbFile)) {
+            // Import from markdown can still be planned: target is empty.
+          }
+
+          const source = await storeForBackend(sourceKind, tier.mailboxDir, { autoImport: false })
+          const targetExists = targetKind === "file" ? existsSync(tier.mailboxDir) : existsSync(dbFile)
+          const target =
+            targetExists || !args.dryRun
+              ? await storeForBackend(targetKind, tier.mailboxDir, { autoImport: false })
+              : undefined
+
+          const known = new Set<string>([tier.project, ...source.projects()])
+          for (const project of target?.projects() ?? []) known.add(project)
+          const projects = args.project ? [args.project] : Array.from(known)
+
+          const reports: string[] = []
+          for (const project of projects) {
+            if (!isSafeRecipient(project)) {
+              reports.push(`${project}: invalid project name, skipped`)
+              continue
+            }
+            const file = mailboxFile(tier.mailboxDir, project)
+
+            if (args.dryRun) {
+              const from =
+                targetKind === "sqlite"
+                  ? existsSync(file)
+                    ? parseMailbox(readFileSync(file, "utf8"))
+                    : []
+                  : source.read(project)
+              const into = target?.read(project) ?? []
+              reports.push(
+                `${project}: would add ${missingMessages(from, into).length}, would ack ${statusUpdates(from, into).length}`,
+              )
+              continue
+            }
+
+            const report =
+              targetKind === "sqlite"
+                ? importFileIntoStore(project, file, target!)
+                : exportStoreIntoFile(project, file, source)
+            reports.push(`${project}: added ${report.added}, acked ${report.acked}`)
+          }
+
+          return {
+            title: "mailbox_migrate",
+            output:
+              `Migrating ${sourceKind} -> ${targetKind} in ${tier.mailboxDir}\n` +
+              reports.join("\n") +
+              `\nSet "storage": "${targetKind}" in the plugin options to use it.`,
+            metadata: { from: sourceKind, to: targetKind, projects: projects.length },
+          }
+        },
+      }),
+
       mailbox_ack: tool({
         description:
           "Flip a message's `**Status:**` line to DONE. Identify the message by exactly one of " +
@@ -592,7 +763,13 @@ export const server: Plugin = async (input, options) => {
           })
           // An ack is progress: it restores the auto-handling budget so a
           // backlog can drain one message per wake instead of stalling at the cap.
-          if (result.changed) restoreBudget(ctx.sessionID)
+          if (result.changed) {
+            try {
+              restoreBudget(ctx.sessionID)
+            } catch {
+              // budget state is best-effort; the ack already succeeded
+            }
+          }
           switch (result.reason) {
             case "not-found":
               return { title: "mailbox_ack", output: `No matching message found in ${project}.` }

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { ackMessage, readMailbox, sendMessage, type AckResult, type SendResult } from "./mailbox.js"
 import { mailboxFile } from "./paths.js"
@@ -33,6 +33,10 @@ export interface MailboxStore {
   append(project: string, input: AppendInput): SendResult
   ack(project: string, target: { hash?: string; header?: string }): AckResult
   query(project: string, filter?: MailboxFilter): MailboxMessage[]
+  /** Insert messages verbatim (migration). Returns how many were added. */
+  importMessages(project: string, messages: MailboxMessage[]): number
+  /** Every project that has messages in this backend. */
+  projects(): string[]
   /** Release resources (database handles). Optional for file-backed stores. */
   close?(): void
 }
@@ -88,6 +92,31 @@ export function createFileStore(dir: string): MailboxStore {
       }
       if (filter.limit && filter.limit > 0) list = list.slice(-filter.limit)
       return list
+    },
+    importMessages(project: string, messages: MailboxMessage[]): number {
+      if (messages.length === 0) return 0
+      const target = fileFor(project)
+      mkdirSync(path.dirname(target), { recursive: true })
+      if (!existsSync(target)) {
+        writeFileSync(
+          target,
+          `# ${project} mailbox\n\nMessages addressed to \`${project}\`. Append-only.\n`,
+          "utf8",
+        )
+      }
+      let endsWithNewline = readFileSync(target, "utf8").endsWith("\n")
+      for (const message of messages) {
+        const block = `### ${message.header}\n**Status:** ${message.status || "OPEN"}\n**Topic:** ${message.topic}\n${message.body}\n`
+        appendFileSync(target, `${endsWithNewline ? "\n" : "\n\n"}${block}`, "utf8")
+        endsWithNewline = block.endsWith("\n")
+      }
+      return messages.length
+    },
+    projects(): string[] {
+      if (!existsSync(root)) return []
+      return readdirSync(root)
+        .filter((name) => name.endsWith(".md") && name !== "README.md")
+        .map((name) => name.slice(0, -3))
     },
   }
 }

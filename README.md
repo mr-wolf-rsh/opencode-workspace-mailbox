@@ -57,10 +57,12 @@ in a PR, greppable, and it survives every process that ever touched it.
 Delivered as tools the agent calls and two hooks the runtime calls:
 
 - **`mailbox_read`** — list `OPEN` messages for a project (or any routed recipient).
-- **`mailbox_send`** — append a message to the recipient's mailbox, optionally spawning a session
-  in the recipient's directory.
+- **`mailbox_send`** — append a message to the recipient's mailbox, optionally delivering it into the
+  recipient's session.
 - **`mailbox_ack`** — flip one message's `**Status:**` line to `DONE`, byte-preserving everywhere
   else.
+- **`mailbox_status`** — backend, locations, and per-project counts for both backends.
+- **`mailbox_migrate`** — copy every message between backends, idempotently; `dryRun` supported.
 
 On `session.idle` (and, with `wake: true`, on a timer) the plugin reads the session's own mailbox,
 finds `OPEN` messages it has not handled yet, and prompts the session **once** to deal with them.
@@ -275,8 +277,38 @@ markdown.
 Set `sqliteMirror: false` if you want the database to be the only artifact. Also add
 `.mailbox.db*` to `.gitignore` (WAL mode creates `-wal` and `-shm` files).
 
-A third backend (Engram, or a remote store) only has to implement the same seven methods — the
-tools, wake path, and delivery code never change.
+A third backend (Engram, or a remote store) only has to implement the same methods — the tools,
+wake path, and delivery code never change.
+
+### Keep the mirror on
+
+The `workspace-mailbox` skill tells agents to read `handoffs/<project>.md`. With
+`sqliteMirror: false` that file stops receiving new messages, so agents following the skill read a
+stale thread. Only disable the mirror if you have also changed the skill flow to use `mailbox_read`.
+
+## Migrating between backends
+
+`mailbox_migrate` copies messages either way, keyed by hash, so re-running it is a no-op and a
+partially-completed run resumes instead of duplicating:
+
+| Call | Effect |
+|---|---|
+| `mailbox_migrate({ to: "sqlite" })` | Imports every markdown mailbox into `<mailboxDir>/.mailbox.db` |
+| `mailbox_migrate({ to: "file" })` | Exports every database row into its markdown mailbox |
+| `mailbox_migrate({ to: "sqlite", dryRun: true })` | Reports the counts that would change, writes nothing |
+
+Both directions also reconcile `OPEN`/`DONE`: a message marked `DONE` on the source is acked on the
+target, so the two never disagree about state.
+
+What it does **not** do:
+
+- Change your `storage` option — set it after migrating.
+- Migrate other tiers — the tool works on the tier the session belongs to. Run it once per tier
+  (meta, each account) if you are switching globally.
+- Deduplicate deliberately duplicated messages: duplicates are counted and preserved.
+
+Switching backends is safe at any time; `mailbox_status` shows both sides so you can verify before
+flipping `storage`.
 
 ## Loop guards
 

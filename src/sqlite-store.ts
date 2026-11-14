@@ -81,7 +81,7 @@ function rowToMessage(row: SqliteRow): MailboxMessage {
  */
 export async function createSqliteStore(
   databaseFile: string,
-  options: { legacyDir?: string; now?: () => number; mirror?: boolean } = {},
+  options: { legacyDir?: string; now?: () => number; mirror?: boolean; autoImport?: boolean } = {},
 ): Promise<MailboxStore> {
   const file = path.resolve(databaseFile)
   const legacyDir = options.legacyDir ?? path.dirname(file)
@@ -89,6 +89,7 @@ export async function createSqliteStore(
   // The markdown file stays the human/agent-readable contract: every append and
   // ack is mirrored into it. The database is what the hot path reads.
   const mirror = options.mirror ?? true
+  const autoImport = options.autoImport ?? true
   const db = openDatabase(file)
 
   db.exec("PRAGMA journal_mode = WAL")
@@ -164,6 +165,7 @@ export async function createSqliteStore(
   }
 
   function importLegacy(project: string): void {
+    if (!autoImport) return
     if (selectImport.get(project)) return
     const legacy = path.join(legacyDir, `${project}.md`)
     if (existsSync(legacy)) {
@@ -263,6 +265,34 @@ export async function createSqliteStore(
       }
       if (filter.limit && filter.limit > 0) list = list.slice(-filter.limit)
       return list
+    },
+    importMessages(project: string, messages: MailboxMessage[]): number {
+      if (messages.length === 0) return 0
+      let added = 0
+      for (const message of messages) {
+        insertMessage.run(
+          project,
+          message.header,
+          message.from,
+          message.to,
+          message.status || "OPEN",
+          message.topic,
+          message.body,
+          message.hash,
+          now(),
+        )
+        added += 1
+      }
+      // Bookkeeping so the lazy file import cannot run again for this project
+      // and duplicate what an explicit migration just added.
+      markImported.run(project, now())
+      return added
+    },
+    projects(): string[] {
+      const rows = db.prepare("SELECT DISTINCT project FROM messages ORDER BY project").all() as {
+        project: string
+      }[]
+      return rows.map((row) => row.project)
     },
     close(): void {
       db.close?.()
