@@ -95,9 +95,9 @@ describe("normalizeConfig", () => {
   })
 
   it("identifies a nested child session by its own directory name", () => {
-    const child = path.join(base, "absolute-scrapers")
+    const child = path.join(base, "scraper-service")
     const cfg = normalizeConfig({ mailboxDir: path.join(base, "handoffs") }, child)
-    expect(cfg.project).toBe("absolute-scrapers")
+    expect(cfg.project).toBe("scraper-service")
   })
 
   it("does not turn every project into the parent when mailboxDir is left to its default", () => {

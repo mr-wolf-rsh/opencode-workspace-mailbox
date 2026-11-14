@@ -33,20 +33,20 @@ describe("discoverTier", () => {
 
   it("classifies a directory under the root as the account tier", () => {
     workspace(tmp)
-    const account = path.join(tmp, "mr-wolf-rsh")
+    const account = path.join(tmp, "acme")
     workspace(account)
 
     const ctx = discoverTier(account)
     expect(ctx.tier).toBe("account")
     expect(ctx.project).toBe("workspace")
-    expect(ctx.accountName).toBe("mr-wolf-rsh")
+    expect(ctx.accountName).toBe("acme")
     expect(ctx.mailboxDir).toBe(path.join(account, "handoffs"))
     expect(ctx.rootMailboxDir).toBe(path.join(tmp, "handoffs"))
   })
 
   it("classifies a nested bucket repo against the account mailbox", () => {
     workspace(tmp)
-    const account = path.join(tmp, "mr-wolf-rsh")
+    const account = path.join(tmp, "acme")
     workspace(account)
     const repo = path.join(account, "tools", "opencode-workspace-mailbox")
     fs.mkdirSync(repo, { recursive: true })
@@ -61,14 +61,14 @@ describe("discoverTier", () => {
 
   it("handles a direct child repo", () => {
     workspace(tmp)
-    const account = path.join(tmp, "absolute-labs-studio")
+    const account = path.join(tmp, "globex")
     workspace(account)
-    const repo = path.join(account, "absolute-scrapers")
+    const repo = path.join(account, "scraper-service")
     fs.mkdirSync(repo, { recursive: true })
 
     const ctx = discoverTier(repo)
     expect(ctx.tier).toBe("repo")
-    expect(ctx.project).toBe("absolute-scrapers")
+    expect(ctx.project).toBe("scraper-service")
     expect(ctx.mailboxDir).toBe(path.join(account, "handoffs"))
   })
 
@@ -112,7 +112,7 @@ describe("routeRecipient", () => {
 
   it("routes a sibling or child to the same tier", () => {
     workspace(tmp)
-    const account = path.join(tmp, "mr-wolf-rsh")
+    const account = path.join(tmp, "acme")
     workspace(account)
     const ctx = discoverTier(account)
     expect(routeRecipient("some-project", ctx)).toEqual({
@@ -123,21 +123,21 @@ describe("routeRecipient", () => {
 
   it("escalates a repo message to its account file in the root tier", () => {
     workspace(tmp)
-    const account = path.join(tmp, "mr-wolf-rsh")
+    const account = path.join(tmp, "acme")
     workspace(account)
     const repo = path.join(account, "tools", "opencode-workspace-mailbox")
     fs.mkdirSync(repo, { recursive: true })
 
     const ctx = discoverTier(repo)
-    expect(routeRecipient("mr-wolf-rsh", ctx)).toEqual({
+    expect(routeRecipient("acme", ctx)).toEqual({
       mailboxDir: path.join(tmp, "handoffs"),
-      project: "mr-wolf-rsh",
+      project: "acme",
     })
   })
 
   it("routes a repo's `workspace` to the account inbox, never its own file", () => {
     workspace(tmp)
-    const account = path.join(tmp, "mr-wolf-rsh")
+    const account = path.join(tmp, "acme")
     workspace(account)
     const repo = path.join(account, "tools", "opencode-workspace-mailbox")
     fs.mkdirSync(repo, { recursive: true })
@@ -151,23 +151,23 @@ describe("routeRecipient", () => {
 
   it("routes account-to-account messages through the root tier", () => {
     workspace(tmp)
-    const mine = path.join(tmp, "mr-wolf-rsh")
+    const mine = path.join(tmp, "acme")
     workspace(mine)
-    workspace(path.join(tmp, "absolute-labs-studio"))
+    workspace(path.join(tmp, "globex"))
 
     const ctx = discoverTier(mine)
-    expect(routeRecipient("absolute-labs-studio", ctx)).toEqual({
+    expect(routeRecipient("globex", ctx)).toEqual({
       mailboxDir: path.join(tmp, "handoffs"),
-      project: "absolute-labs-studio",
+      project: "globex",
     })
   })
 
   it("keeps an account-name send local when already at the root", () => {
     workspace(tmp)
     const ctx = discoverTier(tmp)
-    expect(routeRecipient("mr-wolf-rsh", ctx)).toEqual({
+    expect(routeRecipient("acme", ctx)).toEqual({
       mailboxDir: path.join(tmp, "handoffs"),
-      project: "mr-wolf-rsh",
+      project: "acme",
     })
   })
 })

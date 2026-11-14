@@ -11,7 +11,7 @@ Built for OpenCode today; the storage layer is behind a `MailboxStore` interface
 backend can be swapped for SQLite or Engram — see [Backlog](#backlog).
 
 > Status: the code is complete (81 tests, `typecheck` and `build` green, repo at
-> [mr-wolf-rsh/opencode-workspace-mailbox](https://github.com/mr-wolf-rsh/opencode-workspace-mailbox)).
+> [opencode-workspace-mailbox](https://github.com/mr-wolf-rsh/opencode-workspace-mailbox)).
 > It is not yet published to npm — see [Install](#install).
 
 ## The metaphor
@@ -22,12 +22,12 @@ escalate up, delegate down, or talk to a sibling.
 
 | In an organisation | In opencode-workspace-mailbox |
 |---|---|
-| The chief of staff | **Meta** tier — `D:\WORKSHOP` reads `handoffs/workspace.md` |
-| Account leads | **Account** tier — `mr-wolf-rsh` reads `mr-wolf-rsh/handoffs/workspace.md` |
+| The chief of staff | **Meta** tier — `C:\work` reads `handoffs/workspace.md` |
+| Account leads | **Account** tier — `acme` reads `acme/handoffs/workspace.md` |
 | The team doing the work | **Repo** tier — `<account>/handoffs/<project>.md` |
 | Memos, never rewrites | Append-only markdown; history is the audit trail |
 | "Received" stamp | `**Status:**` flips `OPEN` → `DONE`, one line, nothing else touched |
-| Handing over a task | `mailbox_send({ to: "absolute-scrapers", ... })` |
+| Handing over a task | `mailbox_send({ to: "scraper-service", ... })` |
 | Standing instructions | `wake: true` — an idle session picks up new mail within one poll |
 | Opening a desk for the recipient | `spawnOnSend: true` — creates a session in the recipient's folder |
 | A message that needs a decision | Only then does the agent reply in chat |
@@ -112,11 +112,11 @@ project with nothing open can still be reached. Guarded so it cannot ping-pong �
 Local path variant during development (no publish needed — `prepare` builds it):
 
 ```powershell
-npm install file:D:\WORKSHOP\mr-wolf-rsh\tools\opencode-workspace-mailbox --save
+npm install file:C:\work\acme\tools\opencode-workspace-mailbox --save
 ```
 
 ```jsonc
-["D:\\WORKSHOP\\mr-wolf-rsh\\tools\\opencode-workspace-mailbox", { "wake": true }]
+["C:\\work\\acme\\tools\\opencode-workspace-mailbox", { "wake": true }]
 ```
 
 ## Configuration
@@ -178,9 +178,9 @@ npm install file:D:\WORKSHOP\mr-wolf-rsh\tools\opencode-workspace-mailbox --save
 
 | Tier | Folder | Reads at start | Holds |
 |---|---|---|---|
-| **Meta** | `D:\WORKSHOP` | `handoffs/workspace.md` | `workspace.md` + one file per account |
-| **Account** | `D:\WORKSHOP\mr-wolf-rsh` | `mr-wolf-rsh/handoffs/workspace.md` | `workspace.md` + one file per repo |
-| **Repo** | `.../mr-wolf-rsh/tools/opencode-workspace-mailbox` | `mr-wolf-rsh/handoffs/opencode-workspace-mailbox.md` | its own file, at the account level |
+| **Meta** | `C:\work` | `handoffs/workspace.md` | `workspace.md` + one file per account |
+| **Account** | `C:\work\acme` | `acme/handoffs/workspace.md` | `workspace.md` + one file per repo |
+| **Repo** | `.../acme/tools/opencode-workspace-mailbox` | `acme/handoffs/opencode-workspace-mailbox.md` | its own file, at the account level |
 
 Discovery rules, for a session opened in `D`:
 
@@ -195,10 +195,10 @@ For this workspace:
 
 | Session opened at | Tier | Mailbox |
 |---|---|---|
-| `D:\WORKSHOP` | meta | `D:\WORKSHOP\handoffs\workspace.md` |
-| `D:\WORKSHOP\mr-wolf-rsh` | account | `D:\WORKSHOP\mr-wolf-rsh\handoffs\workspace.md` |
-| `D:\WORKSHOP\mr-wolf-rsh\tools\opencode-workspace-mailbox` | repo | `D:\WORKSHOP\mr-wolf-rsh\handoffs\opencode-workspace-mailbox.md` |
-| `D:\WORKSHOP\absolute-labs-studio\absolute-scrapers` | repo | `D:\WORKSHOP\absolute-labs-studio\handoffs\absolute-scrapers.md` |
+| `C:\work` | meta | `C:\work\handoffs\workspace.md` |
+| `C:\work\acme` | account | `C:\work\acme\handoffs\workspace.md` |
+| `C:\work\acme\tools\opencode-workspace-mailbox` | repo | `C:\work\acme\handoffs\opencode-workspace-mailbox.md` |
+| `C:\work\globex\scraper-service` | repo | `C:\work\globex\handoffs\scraper-service.md` |
 
 ### Routing
 
