@@ -139,4 +139,16 @@ describe("spawn on send", () => {
       fs.rmSync(custom, { recursive: true, force: true })
     }
   })
+
+  it("finds a repo nested in a bucket directory", async () => {
+    fs.rmSync(path.join(tmp, "alpha"), { recursive: true, force: true })
+    const nested = path.join(tmp, "tools", "alpha", "packages")
+    fs.mkdirSync(nested, { recursive: true })
+
+    await setup()
+    const result = await send("alpha")
+    expect(created).toHaveLength(1)
+    expect(created[0].query).toEqual({ directory: path.join(tmp, "tools", "alpha") })
+    expect(result.output).toContain("spawned session")
+  })
 })

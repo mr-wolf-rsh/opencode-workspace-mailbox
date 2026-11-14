@@ -1,5 +1,5 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { existsSync } from "node:fs"
+import { existsSync, readdirSync, type Dirent } from "node:fs"
 import path from "node:path"
 import { normalizeConfig, type MailboxConfig, type NormalizedConfig } from "./config.js"
 import { discoverTier, routeRecipient, type TierContext } from "./discovery.js"
@@ -264,6 +264,31 @@ export const server: Plugin = async (input, options) => {
    * then the workspace root itself for `workspace`, then a sibling of `mailboxDir`.
    * Anything unresolvable is a documented no-op, never a guess.
    */
+  /** Bounded search for a child directory by basename (buckets like `tools/<repo>`). */
+  function findChildDir(root: string, name: string, depth = 3): string | undefined {
+    if (!existsSync(root)) return undefined
+    const target = name.toLowerCase()
+    const skip = new Set(["node_modules", "dist", "build", "bin", "obj", "target", "out"])
+    const queue: Array<{ dir: string; level: number }> = [{ dir: root, level: 0 }]
+    while (queue.length > 0) {
+      const current = queue.shift()!
+      if (current.level > 0 && path.basename(current.dir).toLowerCase() === target) return current.dir
+      if (current.level >= depth) continue
+      let entries: Dirent[]
+      try {
+        entries = readdirSync(current.dir, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        if (entry.name.startsWith(".") || skip.has(entry.name.toLowerCase())) continue
+        queue.push({ dir: path.join(current.dir, entry.name), level: current.level + 1 })
+      }
+    }
+    return undefined
+  }
+
   function resolveProjectDir(to: string): string | undefined {
     const mapped = cfg.projectDirs[to]
     if (mapped) return mapped
@@ -275,7 +300,9 @@ export const server: Plugin = async (input, options) => {
       if (existsSync(account)) return account
     }
     const sibling = path.join(tierRoot, to)
-    return existsSync(sibling) ? sibling : undefined
+    if (existsSync(sibling)) return sibling
+    // Bucket layouts: `<account>/tools/<repo>`, `<account>/labs/<repo>`, ...
+    return findChildDir(tierRoot, to)
   }
 
   async function findSession(directory: string): Promise<string | undefined> {
