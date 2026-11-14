@@ -336,6 +336,10 @@ export async function createSqliteStore(
     },
     close(): void {
       db.close?.()
+      // Bun on Windows keeps the file handle until GC, even after close(), which
+      // makes the database file undeletable for the rest of the process.
+      const bun = (globalThis as { Bun?: { gc?: (force?: boolean) => void } }).Bun
+      bun?.gc?.(true)
     },
   }
 }
