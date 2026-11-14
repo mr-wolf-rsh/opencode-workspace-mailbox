@@ -2,11 +2,9 @@ import { tool, type Plugin } from "@opencode-ai/plugin"
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { normalizeConfig, type MailboxConfig, type NormalizedConfig } from "./config.js"
+import { discoverTier, routeRecipient, type TierContext } from "./discovery.js"
 import { messageHash, normalizeForHash } from "./hash.js"
 import {
-  ackMessage,
-  readMailbox,
-  sendMessage,
   type AckRequest,
   type AckResult,
   type ReadResult,
@@ -17,6 +15,7 @@ import { assertInside, isSafeRecipient, mailboxFile, PathSafetyError, resolveIns
 import { isOpen, parseMailbox, type MailboxMessage } from "./parser.js"
 import { buildCapNotice, buildIdlePrompt } from "./prompt.js"
 import { emptyState, StateStore, type MailboxState, type SessionState } from "./state.js"
+import { createFileStore, type MailboxStore } from "./store.js"
 
 /**
  * opencode-workspace-mailbox plugin entry — makes a session aware of its per-project
@@ -33,6 +32,34 @@ export const server: Plugin = async (input, options) => {
   const cfg: NormalizedConfig = normalizeConfig(options, input.directory)
   const store = new StateStore(cfg.stateFile)
   const { client } = input
+
+  // Tier is derived from the folder tree unless the config pins a mailboxDir.
+  const tier: TierContext = cfg.explicitMailboxDir
+    ? discoverTier(input.directory, { mailboxDir: cfg.mailboxDir, project: cfg.project })
+    : discoverTier(input.directory)
+
+  // One store per mailbox directory; the backend is swappable behind MailboxStore.
+  const stores = new Map<string, MailboxStore>()
+  function storeFor(dir: string): MailboxStore {
+    const key = path.resolve(dir)
+    let found = stores.get(key)
+    if (!found) {
+      found = createFileStore(key)
+      stores.set(key, found)
+    }
+    return found
+  }
+  const own = (): MailboxStore => storeFor(tier.mailboxDir)
+
+  // Dynamic discovery creates the inboxes a tier is supposed to have.
+  try {
+    own().ensure(tier.project)
+    if (tier.tier === "account" && tier.rootMailboxDir && tier.accountName) {
+      storeFor(tier.rootMailboxDir).ensure(tier.accountName)
+    }
+  } catch (error) {
+    console.error(`[opencode-workspace-mailbox] inbox bootstrap failed: ${String(error)}`)
+  }
 
   const MAX_ENTRIES = 500
   /**
@@ -120,8 +147,7 @@ export const server: Plugin = async (input, options) => {
     if (pendingCount(sessionID) > 0) return
     if (source === "poll" && sessions.get(sessionID)?.busy) return
 
-    const file = mailboxFile(cfg.mailboxDir, cfg.project)
-    const { open } = readMailbox(file)
+    const open = own().listOpen(tier.project)
     const state = store.read()
     const session = state.sessions[sessionID] ?? { autoRounds: 0, lastPromptAt: 0 }
 
@@ -155,7 +181,7 @@ export const server: Plugin = async (input, options) => {
       session.lastNoticeAt = now
       state.sessions[sessionID] = session
       store.write(state)
-      notify(sessionID, buildCapNotice(cfg.project, fresh.length, cfg.maxAutoRounds))
+      notify(sessionID, buildCapNotice(tier.project, fresh.length, cfg.maxAutoRounds))
       return
     }
 
@@ -167,7 +193,7 @@ export const server: Plugin = async (input, options) => {
     session.noticeKey = undefined
     state.sessions[sessionID] = session
     store.write(state)
-    dispatchPrompt(sessionID, buildIdlePrompt(cfg.project, fresh))
+    dispatchPrompt(sessionID, buildIdlePrompt(tier.project, fresh))
   }
 
   /** The most recently active session that is not mid-turn, if any. */
@@ -241,9 +267,14 @@ export const server: Plugin = async (input, options) => {
   function resolveProjectDir(to: string): string | undefined {
     const mapped = cfg.projectDirs[to]
     if (mapped) return mapped
-    const root = path.dirname(path.resolve(cfg.mailboxDir))
-    if (to === "workspace") return existsSync(root) ? root : undefined
-    const sibling = path.join(root, to)
+    const tierRoot = path.dirname(path.resolve(tier.mailboxDir))
+    if (to === "workspace") return existsSync(tierRoot) ? tierRoot : undefined
+    // Escalating to an account spawns that account's directory, not a sibling file.
+    if (tier.rootDir && to !== tier.project) {
+      const account = path.join(tier.rootDir, to)
+      if (existsSync(account)) return account
+    }
+    const sibling = path.join(tierRoot, to)
     return existsSync(sibling) ? sibling : undefined
   }
 
@@ -274,7 +305,7 @@ export const server: Plugin = async (input, options) => {
    */
   async function maybeSpawn(sessionID: string, to: string, hash: string): Promise<SpawnOutcome> {
     if (!cfg.spawnOnSend) return { spawned: false, detail: "spawnOnSend is off" }
-    if (to === cfg.project) return { spawned: false, detail: "recipient is this project" }
+    if (to === tier.project) return { spawned: false, detail: "recipient is this project" }
 
     const state = store.read()
     const currentTitle = sessions.get(sessionID)?.title
@@ -381,15 +412,17 @@ export const server: Plugin = async (input, options) => {
             .describe("Project/recipient name (lowercase kebab-case). Defaults to the current project."),
         },
         async execute(args) {
-          const project = args.project ?? cfg.project
+          const project = args.project ?? tier.project
           if (!isSafeRecipient(project)) {
             return { title: "mailbox_read", output: `Invalid project name "${project}": must be lowercase kebab-case.` }
           }
-          const file = mailboxFile(cfg.mailboxDir, project)
-          const { exists, open } = readMailbox(file)
-          if (!exists || open.length === 0) {
+          const route = routeRecipient(project, tier)
+          const target = storeFor(route.mailboxDir)
+          const open = target.listOpen(route.project)
+          if (open.length === 0) {
             return { title: "mailbox_read", output: `No OPEN messages for ${project}.`, metadata: { count: 0 } }
           }
+          const file = mailboxFile(route.mailboxDir, route.project)
           const lines = open.map((m) => `### ${m.header}\nHash: ${m.hash}\nTopic: ${m.topic}\n\n${m.body}`)
           const output = `${project} (${file}): ${open.length} OPEN message(s)\n\n${lines.join("\n\n")}`
           return { title: "mailbox_read", output, metadata: { count: open.length } }
@@ -413,10 +446,16 @@ export const server: Plugin = async (input, options) => {
         },
         async execute(args, ctx) {
           try {
-            const result = sendMessage({
-              mailboxDir: cfg.mailboxDir,
-              to: args.to,
-              from: cfg.project,
+            if (!isSafeRecipient(args.to)) {
+              return {
+                title: "mailbox_send",
+                output: `Invalid recipient "${args.to}": must be lowercase kebab-case.`,
+              }
+            }
+            const route = routeRecipient(args.to, tier)
+            const target = storeFor(route.mailboxDir)
+            const result = target.append(route.project, {
+              from: tier.project,
               topic: args.topic,
               body: args.body,
               status: args.status,
@@ -450,12 +489,15 @@ export const server: Plugin = async (input, options) => {
           header: tool.schema.string().optional().describe("Message header line to ack (case-insensitive)."),
         },
         async execute(args, ctx) {
-          const project = args.project ?? cfg.project
+          const project = args.project ?? tier.project
           if (!isSafeRecipient(project)) {
             return { title: "mailbox_ack", output: `Invalid project name "${project}": must be lowercase kebab-case.` }
           }
-          const file = mailboxFile(cfg.mailboxDir, project)
-          const result = ackMessage({ file, hash: args.hash, header: args.header })
+          const route = routeRecipient(project, tier)
+          const result = storeFor(route.mailboxDir).ack(route.project, {
+            hash: args.hash,
+            header: args.header,
+          })
           // An ack is progress: it restores the auto-handling budget so a
           // backlog can drain one message per wake instead of stalling at the cap.
           if (result.changed) restoreBudget(ctx.sessionID)
@@ -484,9 +526,6 @@ export {
   normalizeConfig,
   parseMailbox,
   isOpen,
-  sendMessage,
-  readMailbox,
-  ackMessage,
   messageHash,
   normalizeForHash,
   isSafeRecipient,
@@ -498,6 +537,9 @@ export {
   StateStore,
   buildIdlePrompt,
   buildCapNotice,
+  discoverTier,
+  routeRecipient,
+  createFileStore,
 }
 export type {
   NormalizedConfig,
@@ -510,6 +552,8 @@ export type {
   AckResult,
   SessionState,
   MailboxState,
+  TierContext,
+  MailboxStore,
 }
 
 export default {

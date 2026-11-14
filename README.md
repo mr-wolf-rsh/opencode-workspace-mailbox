@@ -25,15 +25,12 @@ session: if no session is open, nothing happens.
 
 ## Install
 
-Add the package to `opencode.json`:
+Add the package to `opencode.json` — one global entry serves every tier:
 
 ```jsonc
 {
   "plugin": [
-    ["opencode-workspace-mailbox", {
-      "mailboxDir": "D:\\WORKSHOP\\absolute-labs-studio\\handoffs",
-      "wake": true
-    }]
+    ["opencode-workspace-mailbox", { "wake": true }]
   ]
 }
 ```
@@ -43,20 +40,21 @@ Local path variant during development:
 ```jsonc
 {
   "plugin": [
-    ["D:\\WORKSHOP\\mr-wolf-rsh\\tools\\opencode-workspace-mailbox", { "mailboxDir": "D:\\WORKSHOP\\absolute-labs-studio\\handoffs" }]
+    ["D:\\WORKSHOP\\mr-wolf-rsh\\tools\\opencode-workspace-mailbox", { "wake": true }]
   ]
 }
 ```
 
-Point `mailboxDir` at the workspace handoff directory. Each project then owns one
-`<mailboxDir>/<project>.md` file; `workspace` is the parent's mailbox.
+With no `mailboxDir`, the tier is discovered from the folder tree (see below), which is what a
+single global config should use.
 
 ## Config
 
 | Option         | Default                          | Description                                                        |
 | -------------- | -------------------------------- | ------------------------------------------------------------------ |
-| `mailboxDir`   | `<directory>/handoffs`           | Directory holding `<project>.md` mailbox files.                    |
+| `mailboxDir`   | discovered from the folder tree  | Pin one mailbox directory and disable discovery.                   |
 | `project`      | resolved per session (see below) | Explicit override of this instance's mailbox identity.             |
+| `storage`      | `file`                           | Storage backend. `file` is the MVP; the store interface is pluggable. |
 | `maxAutoRounds`| `2`                              | Auto-prompts in a row with no progress, clamped to `0..20`.        |
 | `cooldownMs`   | `30000`                          | Minimum gap between auto-prompts (and notices).                    |
 | `enabled`      | `true`                           | Master switch.                                                     |
@@ -68,24 +66,40 @@ Point `mailboxDir` at the workspace handoff directory. Each project then owns on
 | `projectDirs`  | `{}`                             | Explicit `{ "<recipient>": "<directory>" }` map for spawning.      |
 | `stateFile`    | `<directory>/.atl/mailbox-state.json` | Persisted dedupe/round state (must stay inside the project). |
 
-## Which project am I?
+## Tiers and identity
 
-Identity is resolved **per session**, so one global config serves every repo:
+Three tiers, keyed to the folder a session opens in. Each tier's `handoffs/` holds its own
+`workspace.md` plus one file per immediate child.
 
-1. `project` set in the options → use it verbatim.
-2. `mailboxDir` is configured and lives **inside** the session directory → this session is the
-   parent, so `project` is `workspace`.
-3. Otherwise → the session directory's basename, kebab-cased.
+| Tier | Folder | Inbox |
+|---|---|---|
+| **Meta** | `D:\WORKSHOP` | `handoffs/workspace.md` |
+| **Account** | `D:\WORKSHOP\mr-wolf-rsh` | `mr-wolf-rsh/handoffs/workspace.md` |
+| **Repo** | `.../mr-wolf-rsh/tools/opencode-workspace-mailbox` | `mr-wolf-rsh/handoffs/opencode-workspace-mailbox.md` |
 
-For a workspace where the parent is `D:\WORKSHOP\absolute-labs-studio` and children live inside it:
+Discovery is derived from the tree, not hardcoded: a directory with `handoffs/` is a tier root
+(meta when nothing above has one, account when the parent does); anything else belongs to the
+nearest ancestor with `handoffs/`, whatever the bucket depth. The inbox file is created on first
+run, and an account session also gets its file at the root.
 
-| Session opened at | Reads/writes |
-|---|---|
-| `D:\WORKSHOP\absolute-labs-studio` | `handoffs\workspace.md` |
-| `D:\WORKSHOP\absolute-labs-studio\absolute-scrapers` | `handoffs\absolute-scrapers.md` |
+**Routing:**
 
-The containment rule only applies to an explicitly configured `mailboxDir`, so the per-project
-default (`<directory>/handoffs`) never turns every project into the parent.
+- `to: workspace` → this tier's `workspace.md`.
+- `to: <account>` (from an account or repo) → the root tier's `<account>.md` — escalate up, or
+  lateral between accounts.
+- `to: <anything else>` → a sibling/child file in this tier — lateral, or delegate down.
+
+An explicit `mailboxDir` in config pins the mailbox and bypasses discovery (kept for
+single-directory setups and tests).
+
+## Storage
+
+Mailboxes sit behind a `MailboxStore` interface — `ensure` / `listOpen` / `read` / `append` /
+`ack` / `query`. The file backend is the MVP; the message format and file layout stay the
+contract, so a SQLite backend (atomic append, indexed OPEN-by-project, WAL concurrency) can
+replace it without touching the tools, the wake path, or spawning. `createFileStore(dir)` is the
+reference implementation.
+
 
 ## Mailbox format
 
@@ -108,8 +122,9 @@ directory (SDK `session.create` with `query.directory`), titled `mailbox: <recip
 **Directory resolution**, in order:
 
 1. `projectDirs[recipient]`, if configured.
-2. `workspace` → the directory containing `mailboxDir`.
-3. A sibling of `mailboxDir` named after the recipient, if it exists.
+2. `workspace` → this tier's own root directory.
+3. An account name → that account's directory under the workspace root.
+4. A sibling of `mailboxDir` named after the recipient, if it exists.
 
 If none resolves, the send still succeeds (the message is appended) and the tool reports why no
 session was created. It never guesses a directory.
