@@ -9,15 +9,20 @@ type Hooks = Awaited<ReturnType<typeof server>>
 let tmp: string
 let mailboxDir: string
 let created: Array<Record<string, unknown>>
+let prompts: Array<Record<string, unknown>>
 let existing: Array<{ id: string; directory: string; time: { updated: number } }>
 let hooks: Hooks | undefined
 
 async function setup(options: Record<string, unknown> = {}) {
   created = []
+  prompts = []
   existing = []
   const client = {
     session: {
-      prompt: async () => ({}),
+      prompt: async (params: Record<string, unknown>) => {
+        prompts.push(params)
+        return {}
+      },
       list: async () => ({ data: existing }),
       create: async (opts: Record<string, unknown>) => {
         created.push(opts)
@@ -38,7 +43,7 @@ async function setup(options: Record<string, unknown> = {}) {
   hooks = await server(input, {
     mailboxDir,
     project: "test-project",
-    spawnOnSend: true,
+    deliverOnSend: "auto",
     spawnCooldownMs: 0,
     ...options,
   })
@@ -66,57 +71,85 @@ afterEach(async () => {
   fs.rmSync(tmp, { recursive: true, force: true })
 })
 
-describe("spawn on send", () => {
-  it("is disabled by default", async () => {
-    await setup({ spawnOnSend: false })
+describe("deliver on send", () => {
+  it("does nothing when deliverOnSend is off", async () => {
+    await setup({ deliverOnSend: "off" })
     const result = await send("alpha")
     expect(created).toHaveLength(0)
-    expect(result.output).not.toContain("Spawn:")
+    expect(prompts).toHaveLength(0)
+    expect(result.output).not.toContain("Delivery:")
   })
 
-  it("creates a session in the recipient directory", async () => {
+  it("auto: creates a session when none exists, then prompts it", async () => {
     await setup()
-    const result = await send("alpha")
+    const result = await send("alpha", "wire the importer")
 
     expect(created).toHaveLength(1)
     expect(created[0].query).toEqual({ directory: path.join(tmp, "alpha") })
-    expect((created[0].body as { title: string }).title).toBe("mailbox: alpha")
+    expect(prompts).toHaveLength(1)
+    expect((prompts[0].path as { id: string }).id).toBe("ses_new")
+    expect(prompts[0].query).toEqual({ directory: path.join(tmp, "alpha") })
+    expect(String((prompts[0].body as { parts: Array<{ text: string }> }).parts[0].text)).toContain("wire the importer")
     expect(result.output).toContain("spawned session ses_new")
   })
 
-  it("does not create a session when one already exists in that directory", async () => {
+  it("auto: reuses an existing session instead of creating one", async () => {
     await setup()
     existing = [{ id: "ses_existing", directory: path.join(tmp, "alpha"), time: { updated: 1 } }]
 
     const result = await send("alpha")
     expect(created).toHaveLength(0)
-    expect(result.output).toContain("session already exists")
+    expect(prompts).toHaveLength(1)
+    expect((prompts[0].path as { id: string }).id).toBe("ses_existing")
+    expect(result.output).toContain("reused session ses_existing")
+    expect(result.metadata).toMatchObject({ delivered: true, spawned: false })
   })
 
-  it("enforces the spawn cooldown", async () => {
+  it("reuse: never creates a session", async () => {
+    await setup({ deliverOnSend: "reuse" })
+    const result = await send("alpha")
+
+    expect(created).toHaveLength(0)
+    expect(prompts).toHaveLength(0)
+    expect(result.output).toContain("no session to reuse")
+  })
+
+  it("spawn: always creates a fresh session even when one exists", async () => {
+    await setup({ deliverOnSend: "spawn" })
+    existing = [{ id: "ses_existing", directory: path.join(tmp, "alpha"), time: { updated: 1 } }]
+
+    const result = await send("alpha")
+    expect(created).toHaveLength(1)
+    expect(prompts).toHaveLength(1)
+    expect((prompts[0].path as { id: string }).id).toBe("ses_new")
+    expect(result.metadata).toMatchObject({ delivered: true, spawned: true })
+  })
+
+  it("enforces the delivery cooldown", async () => {
     await setup({ spawnCooldownMs: 60000 })
     await send("alpha")
     const second = await send("beta")
 
-    expect(created).toHaveLength(1)
+    expect(prompts).toHaveLength(1)
     expect(second.output).toContain("spawn cooldown")
   })
 
-  it("enforces the per-turn spawn cap", async () => {
+  it("enforces the per-turn delivery cap", async () => {
     await setup({ maxSpawnsPerTurn: 1 })
     await send("alpha")
     const second = await send("beta")
 
-    expect(created).toHaveLength(1)
+    expect(prompts).toHaveLength(1)
     expect(second.output).toContain("max 1 spawn(s) per turn")
   })
 
-  it("never spawns from a session the plugin created (loop guard)", async () => {
+  it("never delivers from a session the plugin created (loop guard)", async () => {
     await setup()
     await register("s1", "mailbox: workspace")
 
     const result = await send("alpha")
     expect(created).toHaveLength(0)
+    expect(prompts).toHaveLength(0)
     expect(result.output).toContain("loop guard")
   })
 
@@ -125,6 +158,7 @@ describe("spawn on send", () => {
     const result = await send("nowhere")
 
     expect(created).toHaveLength(0)
+    expect(prompts).toHaveLength(0)
     expect(result.output).toContain('no directory known for "nowhere"')
   })
 
@@ -142,8 +176,7 @@ describe("spawn on send", () => {
 
   it("finds a repo nested in a bucket directory", async () => {
     fs.rmSync(path.join(tmp, "alpha"), { recursive: true, force: true })
-    const nested = path.join(tmp, "tools", "alpha", "packages")
-    fs.mkdirSync(nested, { recursive: true })
+    fs.mkdirSync(path.join(tmp, "tools", "alpha", "packages"), { recursive: true })
 
     await setup()
     const result = await send("alpha")

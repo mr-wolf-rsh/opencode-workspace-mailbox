@@ -29,7 +29,7 @@ escalate up, delegate down, or talk to a sibling.
 | "Received" stamp | `**Status:**` flips `OPEN` → `DONE`, one line, nothing else touched |
 | Handing over a task | `mailbox_send({ to: "scraper-service", ... })` |
 | Standing instructions | `wake: true` — an idle session picks up new mail within one poll |
-| Opening a desk for the recipient | `spawnOnSend: true` — creates a session in the recipient's folder |
+| Opening a desk for the recipient | `deliverOnSend: "auto"` — reuses or creates a session in the recipient's folder and starts it |
 | A message that needs a decision | Only then does the agent reply in chat |
 
 Tiers are **discovered from the folder tree**, not configured: a directory with `handoffs/` is a
@@ -71,11 +71,11 @@ finds `OPEN` messages it has not handled yet, and prompts the session **once** t
 idle *transition* — which means a session that has been sitting idle all afternoon never learns
 about the message your other session just wrote.
 
-### Spawning opens the recipient's desk
+### Delivery opens the recipient's desk
 
-`spawnOnSend: true` creates a session in the recipient's project directory when you send to it, so a
-project with nothing open can still be reached. Guarded so it cannot ping-pong — see
-[Spawn on send](#spawn-on-send).
+`deliverOnSend` hands the message to the recipient's session directly: it reuses one if it exists,
+creates one if it does not, and prompts it — so a project with nothing open can still be reached.
+Guarded so it cannot ping-pong — see [Delivery on send](#delivery-on-send).
 
 ## Install
 
@@ -87,14 +87,14 @@ project with nothing open can still be reached. Guarded so it cannot ping-pong �
      "plugin": [
        ["opencode-workspace-mailbox", {
          "wake": true,
-         "spawnOnSend": true
+         "deliverOnSend": "auto"
        }]
      ]
    }
    ```
 
-   Both flags are off by default: `wake` costs tokens while nobody is watching, and spawning creates
-   sessions on its own. Turn them on deliberately.
+   Both flags are off by default: `wake` costs tokens while nobody is watching, and delivery starts
+   (or creates) a session that runs a turn on its own. Turn them on deliberately.
 
    Do **not** set `mailboxDir` unless you deliberately want one pinned mailbox: it disables tier
    discovery, which is the whole point of a single global config.
@@ -145,15 +145,19 @@ npm install file:C:\work\acme\tools\opencode-workspace-mailbox --save
   "wake": false,
   "pollMs": 10000,
 
-  // Create a session in the recipient's directory when sending.
-  "spawnOnSend": false,
+  // Deliver a sent message into the recipient's session.
+  //   "off"   - write only, the recipient picks it up later
+  //   "reuse" - prompt an existing session, never create one
+  //   "spawn" - always create a fresh session and prompt it
+  //   "auto"  - reuse when one exists, otherwise create, then prompt
+  "deliverOnSend": "off",
   "spawnCooldownMs": 60000,
   "maxSpawnsPerTurn": 1,
 
-  // Explicit recipient -> directory map for spawning. Discovery covers most trees.
+  // Explicit recipient -> directory map for delivery. Discovery covers most trees.
   "projectDirs": {},
 
-  // Where dedupe/round/spawn state is persisted (must stay inside the project directory).
+  // Where dedupe/round/delivery state is persisted (must stay inside the project directory).
   "stateFile": null
 }]
 ```
@@ -168,11 +172,11 @@ npm install file:C:\work\acme\tools\opencode-workspace-mailbox --save
 | `cooldownMs` | `30000` | Gap between auto-prompts and notices. |
 | `wake` | `false` | Poll and wake an idle session. |
 | `pollMs` | `10000` | Wake poll interval, `100..600000`. |
-| `spawnOnSend` | `false` | Create a session in the recipient's directory. |
-| `spawnCooldownMs` | `60000` | Gap between spawns. |
-| `maxSpawnsPerTurn` | `1` | Spawns per human turn, `0..10`. |
+| `deliverOnSend` | `"off"` | `off` / `reuse` / `spawn` / `auto` — see below. |
+| `spawnCooldownMs` | `60000` | Gap between deliveries. |
+| `maxSpawnsPerTurn` | `1` | Deliveries per human turn, `0..10`. |
 | `projectDirs` | `{}` | Explicit recipient → directory map. |
-| `stateFile` | `<dir>/.atl/mailbox-state.json` | Persisted dedupe/round/spawn state. |
+| `stateFile` | `<dir>/.atl/mailbox-state.json` | Persisted dedupe/round/delivery state. |
 
 ## Tiers and identity
 
@@ -271,10 +275,33 @@ only has to implement those six operations — the tools, wake path, and spawnin
 
 Hashes are recorded before dispatch on purpose: a failed prompt is retried, never silently dropped.
 
-## Spawn on send
+## Delivery on send
 
-With `spawnOnSend: true`, `mailbox_send` also creates a session in the recipient's directory
-(`session.create` with `query.directory`), titled `mailbox: <recipient>`.
+`mailbox_send` can hand a message to a session in the recipient's directory instead of waiting for
+the recipient to notice it. One option, four modes:
+
+| `deliverOnSend` | Behaviour |
+|---|---|
+| `"off"` (default) | Write only. The recipient picks it up on idle or `wake`. |
+| `"reuse"` | Prompt an existing session for that directory. Never create one. |
+| `"spawn"` | Always create a fresh session, titled `mailbox: <recipient>`, and prompt it. |
+| `"auto"` | Reuse when a session exists, otherwise create, then prompt either way. |
+
+Delivery is a `session.prompt` (or `promptAsync`) with `query.directory`, so a session in
+`tools/opencode-workspace-mailbox` can start a turn in `globex/scraper-service` without any terminal
+being attached. The prompt carries the topic and the absolute mailbox path.
+
+**How the target session is handled:**
+
+- `reuse`/`auto` pick the most recently updated session whose `directory` matches the recipient's
+  directory — that is how you keep one long-running session instead of accumulating new ones.
+- `spawn` always creates a new session record. Use it only when you deliberately want a clean
+  context; `auto` is the practical default.
+- The delivered session runs **headless**: a server-side turn with no UI. You can open it later from
+  that project's session list, but nothing pops up on screen.
+- Nothing is killed afterwards. The session stays as a record (idle), and `reuse`/`auto` will pick
+  it up next time; `spawn` will not.
+- A headless session that hits a permission prompt has nobody to answer it, so it can stall there.
 
 **Directory resolution**, in order:
 
@@ -284,18 +311,35 @@ With `spawnOnSend: true`, `mailbox_send` also creates a session in the recipient
 4. A sibling of the mailbox directory, or a bounded search for a nested bucket
    (`<account>/tools/<repo>`).
 
-If nothing resolves, the send still succeeds and the tool reports why no session was created. It
-never guesses a directory.
+If nothing resolves, the send still succeeds and the tool reports why no delivery happened. It never
+guesses a directory.
 
-**What spawning does not do:** it creates a server-side session; it does not attach a terminal
-window. A headless session that hits a permission prompt has nobody to answer it.
+## Scale and retention
+
+The file backend re-reads and re-parses one mailbox file per trigger (idle, or one `wake` poll).
+Measured on this workspace: a **110 KB** mailbox with 59 messages parses in **0.67 ms**; at the
+default 10 s poll that is a rounding error. The cost is linear, though — 10 MB is roughly 60 ms per
+tick, and append-only files never shrink on their own.
+
+That is exactly why storage sits behind `MailboxStore`. The scalable path, in order of value:
+
+1. **SQLite backend** — `INSERT` for append, an index on `(project, status)`, WAL for concurrent
+   sessions, and `query` that never scans a whole file. The tools, wake path and delivery code do
+   not change.
+2. **Retention** — move `DONE` rows (or message blocks) older than N days into an archive table or
+   `_archive/` file. History is preserved, the hot path stays small.
+3. **`since` watermark** — a new session stops replaying a mailbox's entire history on first contact.
+
+Until then: keep per-project files bounded by archiving handled threads, which is what
+`_archive/` is for.
 
 ## Limitations
 
-- **Delivery needs a plugin instance serving the recipient directory.** With no session there, the
-  message waits in its file. `spawnOnSend` creates a session but cannot attach a TUI to it.
-- **One project per plugin instance.** Cross-project activation beyond `session.create` is out of
-  scope; identity is resolved per session, never shared.
+- **A spawned session is not a terminal.** Delivery creates and prompts a server-side session; it
+  does not open a TUI. A headless session blocked on a permission prompt has nobody to answer it.
+- **Delivery needs a resolvable directory.** If the recipient's project folder cannot be found, the
+  message is written and the tool reports why nothing was delivered.
+- **One project per plugin instance.** Identity is resolved per session, never shared.
 - **`wake` spends tokens with nobody watching**, at the pace messages arrive. Leave it off for
   idle-only delivery.
 - **No migration of old layouts.** Pointing the plugin at a mailbox directory that still holds

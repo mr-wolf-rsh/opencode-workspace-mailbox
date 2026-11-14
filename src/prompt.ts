@@ -18,3 +18,14 @@ export function buildIdlePrompt(project: string, messages: MailboxMessage[]): st
 export function buildCapNotice(project: string, count: number, maxAutoRounds = 2): string {
   return `Mailbox: ${count} OPEN message(s) in ${project} — auto-handling stopped after ${maxAutoRounds} round(s); ask me to handle them.`
 }
+
+/** Instruction used when a sender delivers a message into another session. */
+export function buildDeliveryPrompt(from: string, to: string, topic: string, mailboxPath: string): string {
+  return (
+    `A new mailbox message from ${from} was just delivered to ${to}.\n\n` +
+    `Topic: ${topic}\n` +
+    `File: ${mailboxPath}\n\n` +
+    `Load the \`workspace-mailbox\` skill, read that file, handle this message, ` +
+    `flip it to DONE with \`mailbox_ack\`, and reply with \`mailbox_send\` only if a decision is needed.`
+  )
+}

@@ -13,7 +13,7 @@ import {
 } from "./mailbox.js"
 import { assertInside, isSafeRecipient, mailboxFile, PathSafetyError, resolveInside } from "./paths.js"
 import { isOpen, parseMailbox, type MailboxMessage } from "./parser.js"
-import { buildCapNotice, buildIdlePrompt } from "./prompt.js"
+import { buildCapNotice, buildDeliveryPrompt, buildIdlePrompt } from "./prompt.js"
 import { emptyState, StateStore, type MailboxState, type SessionState } from "./state.js"
 import { createFileStore, type MailboxStore } from "./store.js"
 
@@ -323,62 +323,107 @@ export const server: Plugin = async (input, options) => {
     }
   }
 
-  type SpawnOutcome = { spawned: boolean; detail: string }
+  type DeliverOutcome = { delivered: boolean; created: boolean; detail: string }
+
+  /** Start a turn in a session that lives in another directory (sender-driven delivery). */
+  function dispatchDelivery(targetID: string, directory: string, text: string): void {
+    const body = { parts: [{ type: "text" as const, text }] }
+    const params = { path: { id: targetID }, query: { directory }, body }
+    try {
+      const promise = client.session.promptAsync
+        ? client.session.promptAsync(params)
+        : client.session.prompt(params)
+      promise.catch((error: unknown) => {
+        console.error(`[opencode-workspace-mailbox] delivery prompt failed: ${String(error)}`)
+      })
+    } catch (error) {
+      console.error(`[opencode-workspace-mailbox] delivery prompt failed: ${String(error)}`)
+    }
+  }
 
   /**
-   * Create a session in the recipient's directory. Guards, in order: feature
-   * flag, self-send, cascade (a session this plugin spawned never spawns),
-   * duplicate message, cooldown, per-turn cap, then directory resolution.
+   * Deliver a just-sent message into the recipient's session.
+   *
+   * Modes: `off` does nothing; `reuse` prompts an existing session and never
+   * creates one; `spawn` always creates a fresh session and prompts it; `auto`
+   * reuses when one exists, otherwise creates, then prompts either way.
+   *
+   * Guards, in order: enabled mode, self-send, cascade (a session this plugin
+   * spawned never delivers), duplicate message, cooldown, per-turn cap, then
+   * directory resolution.
    */
-  async function maybeSpawn(sessionID: string, to: string, hash: string): Promise<SpawnOutcome> {
-    if (!cfg.spawnOnSend) return { spawned: false, detail: "spawnOnSend is off" }
-    if (to === tier.project) return { spawned: false, detail: "recipient is this project" }
+  async function maybeDeliver(
+    sessionID: string,
+    to: string,
+    hash: string,
+    topic: string,
+  ): Promise<DeliverOutcome> {
+    const mode = cfg.deliverOnSend
+    if (mode === "off") return { delivered: false, created: false, detail: "deliverOnSend is off" }
+    if (to === tier.project) {
+      return { delivered: false, created: false, detail: "recipient is this project" }
+    }
 
     const state = store.read()
     const currentTitle = sessions.get(sessionID)?.title
     if (currentTitle?.startsWith(SPAWN_TITLE_PREFIX) || state.spawnedSessions.includes(sessionID)) {
-      return { spawned: false, detail: "loop guard: this session was spawned" }
+      return { delivered: false, created: false, detail: "loop guard: this session was spawned" }
     }
     if (state.spawnedHashes.includes(hash)) {
-      return { spawned: false, detail: "already spawned for this message" }
+      return { delivered: false, created: false, detail: "already delivered for this message" }
     }
 
     const now = Date.now()
     if (now - (state.lastSpawnAt ?? 0) < cfg.spawnCooldownMs) {
-      return { spawned: false, detail: `spawn cooldown (${cfg.spawnCooldownMs} ms)` }
+      return { delivered: false, created: false, detail: `spawn cooldown (${cfg.spawnCooldownMs} ms)` }
     }
     const session = state.sessions[sessionID] ?? { autoRounds: 0, lastPromptAt: 0 }
     if ((session.spawnsThisTurn ?? 0) >= cfg.maxSpawnsPerTurn) {
-      return { spawned: false, detail: `max ${cfg.maxSpawnsPerTurn} spawn(s) per turn reached` }
+      return { delivered: false, created: false, detail: `max ${cfg.maxSpawnsPerTurn} spawn(s) per turn reached` }
     }
 
     const directory = resolveProjectDir(to)
     if (!directory) {
-      return { spawned: false, detail: `no directory known for "${to}" (set projectDirs)` }
+      return { delivered: false, created: false, detail: `no directory known for "${to}" (set projectDirs)` }
     }
 
-    const existing = await findSession(directory)
-    if (existing) return { spawned: false, detail: `session already exists (${existing})` }
-
-    try {
-      const created = await client.session.create({
-        query: { directory },
-        body: { title: `${SPAWN_TITLE_PREFIX} ${to}` },
-      })
-      const id = (created as { data?: { id?: string } }).data?.id
-      if (!id) return { spawned: false, detail: "session.create returned no id" }
-
-      session.spawnsThisTurn = (session.spawnsThisTurn ?? 0) + 1
-      state.sessions[sessionID] = session
-      state.lastSpawnAt = now
-      recordHashes(state.spawnedSessions, [id])
-      recordHashes(state.spawnedHashes, [hash])
-      store.write(state)
-      track(id, false, `${SPAWN_TITLE_PREFIX} ${to}`)
-      return { spawned: true, detail: `spawned session ${id} in ${directory}` }
-    } catch (error) {
-      return { spawned: false, detail: `session.create failed: ${String(error)}` }
+    let targetID = mode === "spawn" ? undefined : await findSession(directory)
+    if (!targetID && mode === "reuse") {
+      return { delivered: false, created: false, detail: `no session to reuse in ${directory}` }
     }
+
+    let createdID: string | undefined
+    if (!targetID) {
+      try {
+        const created = await client.session.create({
+          query: { directory },
+          body: { title: `${SPAWN_TITLE_PREFIX} ${to}` },
+        })
+        targetID = (created as { data?: { id?: string } }).data?.id
+        if (!targetID) return { delivered: false, created: false, detail: "session.create returned no id" }
+        createdID = targetID
+        track(targetID, false, `${SPAWN_TITLE_PREFIX} ${to}`)
+      } catch (error) {
+        return { delivered: false, created: false, detail: `session.create failed: ${String(error)}` }
+      }
+    }
+
+    const route = routeRecipient(to, tier)
+    dispatchDelivery(
+      targetID,
+      directory,
+      buildDeliveryPrompt(tier.project, to, topic, mailboxFile(route.mailboxDir, route.project)),
+    )
+
+    session.spawnsThisTurn = (session.spawnsThisTurn ?? 0) + 1
+    state.sessions[sessionID] = session
+    state.lastSpawnAt = now
+    if (createdID) recordHashes(state.spawnedSessions, [createdID])
+    recordHashes(state.spawnedHashes, [hash])
+    store.write(state)
+
+    const verb = createdID ? "spawned" : "reused"
+    return { delivered: true, created: createdID !== undefined, detail: `${verb} session ${targetID} in ${directory}` }
   }
 
   return {
@@ -490,12 +535,12 @@ export const server: Plugin = async (input, options) => {
             store.update((state: MailboxState) => {
               recordHashes(state.ownWrites, [result.hash])
             })
-            const spawn = await maybeSpawn(ctx.sessionID, args.to, result.hash)
-            const suffix = cfg.spawnOnSend ? ` Spawn: ${spawn.detail}.` : ""
+            const delivery = await maybeDeliver(ctx.sessionID, args.to, result.hash, args.topic)
+            const suffix = cfg.deliverOnSend === "off" ? "" : ` Delivery: ${delivery.detail}.`
             return {
               title: "mailbox_send",
               output: `Appended message to ${args.to} (hash ${result.hash}) in ${result.file}.${suffix}`,
-              metadata: { hash: result.hash, spawned: spawn.spawned },
+              metadata: { hash: result.hash, delivered: delivery.delivered, spawned: delivery.created },
             }
           } catch (error) {
             return { title: "mailbox_send", output: `Failed to send message: ${String(error)}` }

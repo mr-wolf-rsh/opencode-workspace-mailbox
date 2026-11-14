@@ -1,6 +1,8 @@
 import path from "node:path"
 import { assertInside, isSafeRecipient } from "./paths.js"
 
+export type DeliverMode = "off" | "reuse" | "spawn" | "auto"
+
 export type MailboxConfig = {
   mailboxDir?: string
   project?: string | null
@@ -10,6 +12,8 @@ export type MailboxConfig = {
   stateFile?: string | null
   wake?: boolean
   pollMs?: number
+  deliverOnSend?: DeliverMode
+  /** @deprecated alias for deliverOnSend: "spawn" */
   spawnOnSend?: boolean
   spawnCooldownMs?: number
   maxSpawnsPerTurn?: number
@@ -28,7 +32,7 @@ export type NormalizedConfig = {
   stateFile: string
   wake: boolean
   pollMs: number
-  spawnOnSend: boolean
+  deliverOnSend: DeliverMode
   spawnCooldownMs: number
   maxSpawnsPerTurn: number
   projectDirs: Record<string, string>
@@ -96,7 +100,15 @@ export function normalizeConfig(
   const enabled = typeof opts.enabled === "boolean" ? opts.enabled : true
   const wake = typeof opts.wake === "boolean" ? opts.wake : false
   const pollMs = clampInt(opts.pollMs, 10000, 100, 600000)
-  const spawnOnSend = typeof opts.spawnOnSend === "boolean" ? opts.spawnOnSend : false
+  const deliverOnSend: DeliverMode =
+    opts.deliverOnSend === "reuse" ||
+    opts.deliverOnSend === "spawn" ||
+    opts.deliverOnSend === "auto" ||
+    opts.deliverOnSend === "off"
+      ? opts.deliverOnSend
+      : opts.spawnOnSend === true
+        ? "spawn"
+        : "off"
   const spawnCooldownMs = nonNegativeInt(opts.spawnCooldownMs, 60000)
   const maxSpawnsPerTurn = clampInt(opts.maxSpawnsPerTurn, 1, 0, 10)
   const projectDirs: Record<string, string> = {}
@@ -125,7 +137,7 @@ export function normalizeConfig(
     stateFile,
     wake,
     pollMs,
-    spawnOnSend,
+    deliverOnSend,
     spawnCooldownMs,
     maxSpawnsPerTurn,
     projectDirs,
