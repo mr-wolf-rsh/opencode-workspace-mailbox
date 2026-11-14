@@ -284,6 +284,8 @@ humans keep reading the file; the plugin stops parsing it on the hot path. Exist
 imported once per project on first open, so switching backends keeps the history that started in
 markdown.
 
+The file backend and the state file write under an exclusive `.lock` sidecar (a stale lock from a crashed writer is stolen), so two sessions sharing one mailbox cannot clobber each other's append or ack.
+
 Set `sqliteMirror: false` if you want the database to be the only artifact. Also add
 `.mailbox.db*` to `.gitignore` (WAL mode creates `-wal` and `-shm` files).
 
@@ -337,7 +339,8 @@ flipping `storage`.
 1. **Trigger** — `session.idle`, or a `wake` poll tick for the most recently active non-busy session.
 2. **Skip** — plugin is disabled, this session was just prompted by the plugin, or the session is
    mid-turn.
-3. **Filter** — keep `OPEN` messages whose hash is not in `prompted` and not in `ownWrites`.
+3. **Filter** — keep `OPEN` messages newer than `since` whose hash is not in `prompted` and not in
+   `ownWrites`.
 4. **Budget** — if the inbox is empty, reset the round budget; if the cap or cooldown is hit, stop
    (surfacing a one-line toast at most once per pending set).
 5. **Dispatch** — record every hash *before* prompting, then send one prompt: load the
@@ -448,8 +451,6 @@ Ideas for the future — not implemented yet.
 - **Scheduled retention** — run the prune pass on a timer instead of on demand.
 - **Migration helper for legacy layouts** — move pre-hierarchy top-level files into the tier layout
   with an explicit, reviewable command instead of leaving them behind.
-- **Cross-process file lock** — the file backend still does read-modify-write on ack; sqlite/WAL
-  does not. A lock file would make the file backend safe for two writers on one mailbox.
 
 ---
 
