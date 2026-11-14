@@ -16,6 +16,7 @@ import { isOpen, parseMailbox, type MailboxMessage } from "./parser.js"
 import { buildCapNotice, buildDeliveryPrompt, buildIdlePrompt } from "./prompt.js"
 import { emptyState, StateStore, type MailboxState, type SessionState } from "./state.js"
 import { createFileStore, type MailboxStore } from "./store.js"
+import { createSqliteStore } from "./sqlite-store.js"
 
 /**
  * opencode-workspace-mailbox plugin entry — makes a session aware of its per-project
@@ -39,23 +40,33 @@ export const server: Plugin = async (input, options) => {
     : discoverTier(input.directory)
 
   // One store per mailbox directory; the backend is swappable behind MailboxStore.
-  const stores = new Map<string, MailboxStore>()
-  function storeFor(dir: string): MailboxStore {
+  const stores = new Map<string, Promise<MailboxStore>>()
+
+  function storeFor(dir: string): Promise<MailboxStore> {
     const key = path.resolve(dir)
     let found = stores.get(key)
     if (!found) {
-      found = createFileStore(key)
+      found =
+        cfg.storage === "sqlite"
+          ? createSqliteStore(cfg.sqlitePath ?? path.join(key, ".mailbox.db"), {
+              legacyDir: key,
+              mirror: cfg.sqliteMirror,
+            })
+          : Promise.resolve(createFileStore(key))
       stores.set(key, found)
     }
     return found
   }
-  const own = (): MailboxStore => storeFor(tier.mailboxDir)
+
+  const own = (): Promise<MailboxStore> => storeFor(tier.mailboxDir)
 
   // Dynamic discovery creates the inboxes a tier is supposed to have.
   try {
-    own().ensure(tier.project)
+    const ownStore = await own()
+    ownStore.ensure(tier.project)
     if (tier.tier === "account" && tier.rootMailboxDir && tier.accountName) {
-      storeFor(tier.rootMailboxDir).ensure(tier.accountName)
+      const rootStore = await storeFor(tier.rootMailboxDir)
+      rootStore.ensure(tier.accountName)
     }
   } catch (error) {
     console.error(`[opencode-workspace-mailbox] inbox bootstrap failed: ${String(error)}`)
@@ -147,7 +158,7 @@ export const server: Plugin = async (input, options) => {
     if (pendingCount(sessionID) > 0) return
     if (source === "poll" && sessions.get(sessionID)?.busy) return
 
-    const open = own().listOpen(tier.project)
+    const open = (await own()).listOpen(tier.project)
     const state = store.read()
     const session = state.sessions[sessionID] ?? { autoRounds: 0, lastPromptAt: 0 }
 
@@ -453,6 +464,15 @@ export const server: Plugin = async (input, options) => {
         clearInterval(timer)
         timer = undefined
       }
+      for (const pending of stores.values()) {
+        try {
+          const opened = await pending
+          opened.close?.()
+        } catch {
+          // a store that failed to open has nothing to close
+        }
+      }
+      stores.clear()
     },
 
     "chat.message": async ({ sessionID }) => {
@@ -489,7 +509,7 @@ export const server: Plugin = async (input, options) => {
             return { title: "mailbox_read", output: `Invalid project name "${project}": must be lowercase kebab-case.` }
           }
           const route = routeRecipient(project, tier)
-          const target = storeFor(route.mailboxDir)
+          const target = await storeFor(route.mailboxDir)
           const open = target.listOpen(route.project)
           if (open.length === 0) {
             return { title: "mailbox_read", output: `No OPEN messages for ${project}.`, metadata: { count: 0 } }
@@ -525,7 +545,7 @@ export const server: Plugin = async (input, options) => {
               }
             }
             const route = routeRecipient(args.to, tier)
-            const target = storeFor(route.mailboxDir)
+            const target = await storeFor(route.mailboxDir)
             const result = target.append(route.project, {
               from: tier.project,
               topic: args.topic,
@@ -566,7 +586,7 @@ export const server: Plugin = async (input, options) => {
             return { title: "mailbox_ack", output: `Invalid project name "${project}": must be lowercase kebab-case.` }
           }
           const route = routeRecipient(project, tier)
-          const result = storeFor(route.mailboxDir).ack(route.project, {
+          const result = (await storeFor(route.mailboxDir)).ack(route.project, {
             hash: args.hash,
             header: args.header,
           })

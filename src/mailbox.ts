@@ -20,7 +20,7 @@ function pad2(n: number): string {
   return String(n).padStart(2, "0")
 }
 
-function buildHeader(to: string, from: string, now: Date): string {
+export function buildHeader(to: string, from: string, now: Date): string {
   const date = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`
   const time = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`
   return `${date} ${time} — from ${from} → to ${to}`

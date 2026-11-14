@@ -3,9 +3,15 @@ import { assertInside, isSafeRecipient } from "./paths.js"
 
 export type DeliverMode = "off" | "reuse" | "spawn" | "auto"
 
+export type StorageBackend = "file" | "sqlite"
+
 export type MailboxConfig = {
   mailboxDir?: string
   project?: string | null
+  storage?: StorageBackend
+  sqlitePath?: string | null
+  /** Mirror database writes back into the markdown file (default true). */
+  sqliteMirror?: boolean
   maxAutoRounds?: number
   cooldownMs?: number
   enabled?: boolean
@@ -25,7 +31,10 @@ export type NormalizedConfig = {
   project: string
   /** True when mailboxDir came from options (disables folder-tree discovery). */
   explicitMailboxDir: boolean
-  storage: "file"
+  storage: StorageBackend
+  /** Database file when storage is "sqlite"; null means `<mailboxDir>/.mailbox.db`. */
+  sqlitePath: string | null
+  sqliteMirror: boolean
   maxAutoRounds: number
   cooldownMs: number
   enabled: boolean
@@ -70,9 +79,12 @@ export function normalizeConfig(
   const configuredMailboxDir =
     typeof opts.mailboxDir === "string" && opts.mailboxDir.length > 0 ? opts.mailboxDir : null
   const mailboxDir = path.resolve(configuredMailboxDir ?? path.join(directory, "handoffs"))
-  // Only the file backend is implemented today; the field exists so a SQLite
-  // backend can be selected later without a config-format change.
-  const storage: "file" = "file"
+  const storage: StorageBackend = opts.storage === "sqlite" ? "sqlite" : "file"
+  const sqlitePath =
+    typeof opts.sqlitePath === "string" && opts.sqlitePath.length > 0
+      ? path.resolve(opts.sqlitePath)
+      : null
+  const sqliteMirror = typeof opts.sqliteMirror === "boolean" ? opts.sqliteMirror : true
 
   const rawProject = opts.project
   const configuredProject = typeof rawProject === "string" && rawProject.length > 0 ? rawProject : null
@@ -131,6 +143,8 @@ export function normalizeConfig(
     project,
     explicitMailboxDir: configuredMailboxDir !== null,
     storage,
+    sqlitePath,
+    sqliteMirror,
     maxAutoRounds,
     cooldownMs,
     enabled,

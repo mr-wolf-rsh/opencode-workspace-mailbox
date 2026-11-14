@@ -132,8 +132,13 @@ npm install file:C:\work\acme\tools\opencode-workspace-mailbox --save
   // Override the derived identity ("workspace" for a tier root, else the folder name).
   "project": null,
 
-  // Storage backend. "file" is the MVP; the store interface is pluggable.
+  // Storage backend: "file" (markdown is the source) or "sqlite" (database is
+  // the source, markdown is written as a mirror).
   "storage": "file",
+  // Database location for storage: "sqlite". Default: <mailboxDir>/.mailbox.db
+  "sqlitePath": null,
+  // Mirror sqlite appends/acks back into the markdown file (default true).
+  "sqliteMirror": true,
 
   // Auto-prompts in a row without progress, then one toast instead. 0..20.
   "maxAutoRounds": 2,
@@ -167,7 +172,9 @@ npm install file:C:\work\acme\tools\opencode-workspace-mailbox --save
 | `enabled` | `true` | Master switch. |
 | `mailboxDir` | discovered | Pin a mailbox directory; disables discovery. |
 | `project` | resolved | Explicit identity override. |
-| `storage` | `file` | Backend selector (`file` implemented). |
+| `storage` | `"file"` | `"file"` or `"sqlite"`. |
+| `sqlitePath` | `<mailboxDir>/.mailbox.db` | Database file for the sqlite backend. |
+| `sqliteMirror` | `true` | Mirror sqlite writes into the markdown file. |
 | `maxAutoRounds` | `2` | Auto-prompts in a row without progress, `0..20`. |
 | `cooldownMs` | `30000` | Gap between auto-prompts and notices. |
 | `wake` | `false` | Poll and wake an idle session. |
@@ -242,12 +249,34 @@ interface MailboxStore {
   append(project: string, input: AppendInput): SendResult
   ack(project: string, target: { hash?: string; header?: string }): AckResult
   query(project: string, filter?: MailboxFilter): MailboxMessage[]
+  close?(): void
 }
 ```
 
-`createFileStore(dir)` is the reference backend. The message format and file layout are the contract:
-a SQLite backend (atomic append, indexed OPEN-by-project, WAL concurrency) or an Engram-backed store
-only has to implement those six operations — the tools, wake path, and spawning never change.
+Two backends ship:
+
+| Backend | Source of truth | Hot path |
+|---|---|---|
+| `"file"` (default) | the markdown file | reads and parses one file per trigger |
+| `"sqlite"` | `<mailboxDir>/.mailbox.db` | indexed `SELECT`s; no file parsing |
+
+**SQLite details.** One database per mailbox directory, `WAL` mode, tables
+`messages(project, header, sender, recipient, status, topic, body, hash, created_at)` with indexes on
+`(project, status)` and `(project, hash)`, plus an `imported(project, at)` table. The driver is
+`bun:sqlite` when running under Bun (OpenCode) and `node:sqlite` on Node ≥ 22.5, loaded through
+`createRequire` so both work.
+
+**Markdown stays the contract.** With `sqliteMirror: true` (default), every append is written to the
+database *and* appended to `<project>.md`, and every ack flips the status line in both. Agents and
+humans keep reading the file; the plugin stops parsing it on the hot path. Existing files are
+imported once per project on first open, so switching backends keeps the history that started in
+markdown.
+
+Set `sqliteMirror: false` if you want the database to be the only artifact. Also add
+`.mailbox.db*` to `.gitignore` (WAL mode creates `-wal` and `-shm` files).
+
+A third backend (Engram, or a remote store) only has to implement the same seven methods — the
+tools, wake path, and delivery code never change.
 
 ## Loop guards
 
@@ -317,26 +346,30 @@ guesses a directory.
 ## Scale and retention
 
 The file backend re-reads and re-parses one mailbox file per trigger (idle, or one `wake` poll).
-Measured on this workspace: a **110 KB** mailbox with 59 messages parses in **0.67 ms**; at the
-default 10 s poll that is a rounding error. The cost is linear, though — 10 MB is roughly 60 ms per
-tick, and append-only files never shrink on their own.
+Measured on this workspace: a **110 KB** mailbox with 59 messages parses in **0.67 ms** — at the
+default 10 s poll that is a rounding error, but the cost is linear and append-only files never
+shrink on their own.
 
-That is exactly why storage sits behind `MailboxStore`. The scalable path, in order of value:
+`storage: "sqlite"` removes the file from the hot path entirely: indexed lookups for
+`(project, status)`, an `INSERT` per message, WAL for concurrent sessions, and no parsing per tick.
+With the mirror on, markdown still grows — but only agents and humans read it, once per handled
+message, never on a timer.
 
-1. **SQLite backend** — `INSERT` for append, an index on `(project, status)`, WAL for concurrent
-   sessions, and `query` that never scans a whole file. The tools, wake path and delivery code do
-   not change.
-2. **Retention** — move `DONE` rows (or message blocks) older than N days into an archive table or
-   `_archive/` file. History is preserved, the hot path stays small.
-3. **`since` watermark** — a new session stops replaying a mailbox's entire history on first contact.
+What is still on the table:
 
-Until then: keep per-project files bounded by archiving handled threads, which is what
-`_archive/` is for.
+1. **Retention** — move `DONE` history older than N days into an archive table (and out of the
+   mirror). The hot path stays small, the audit trail survives.
+2. **`since` watermark** — a new session stops replaying a mailbox's entire history on first contact.
+
+Until then: per-project files stay bounded by archiving handled threads, which is what `_archive/`
+is for.
 
 ## Limitations
 
 - **A spawned session is not a terminal.** Delivery creates and prompts a server-side session; it
   does not open a TUI. A headless session blocked on a permission prompt has nobody to answer it.
+- **SQLite needs a driver**: `bun:sqlite` under OpenCode, or `node:sqlite` on Node ≥ 22.5. The
+  plugin reports a clear error instead of silently falling back to files.
 - **Delivery needs a resolvable directory.** If the recipient's project folder cannot be found, the
   message is written and the tool reports why nothing was delivered.
 - **One project per plugin instance.** Identity is resolved per session, never shared.
@@ -356,11 +389,10 @@ Until then: keep per-project files bounded by archiving handled threads, which i
 
 Ideas for the future — not implemented yet.
 
-- **SQLite backend** — implement `MailboxStore` over SQLite: atomic append, an index on
-  `(project, status)`, WAL for concurrent sessions, and `query` without re-parsing files. The
-  interface and the message format already allow it.
+- **Retention policy** — archive `DONE` history older than N days into a table (and out of the
+  mirror) on a schedule or on ack.
 - **Engram backend** — reuse the persistent-memory store for teams that want mailboxes outside the
-  repo. Same six operations.
+  repo. Same seven methods.
 - **`to: all` broadcast** — the protocol allows a broadcast copied into every file in a tier; today
   `all` is treated as a normal recipient name.
 - **Migration helper** — move legacy top-level files into the tier layout with an explicit,

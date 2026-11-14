@@ -26,13 +26,15 @@ export type AppendInput = {
 export interface MailboxStore {
   readonly kind: string
   readonly dir: string
-  /** Create the project's mailbox file if it is missing; returns its path. */
+  /** Create the project's inbox if it is missing; returns its location. */
   ensure(project: string): string
   listOpen(project: string): MailboxMessage[]
   read(project: string): MailboxMessage[]
   append(project: string, input: AppendInput): SendResult
   ack(project: string, target: { hash?: string; header?: string }): AckResult
   query(project: string, filter?: MailboxFilter): MailboxMessage[]
+  /** Release resources (database handles). Optional for file-backed stores. */
+  close?(): void
 }
 
 export function createFileStore(dir: string): MailboxStore {
