@@ -24,6 +24,12 @@ export type MailboxConfig = {
   spawnCooldownMs?: number
   maxSpawnsPerTurn?: number
   projectDirs?: Record<string, string>
+  /** Ignore messages older than this ISO date (first-contact watermark). */
+  since?: string | null
+  /** Move DONE messages older than this many days to the archive. 0 = never. */
+  retentionDays?: number
+  /** Archive destination for the file backend. Default: <mailboxDir>/_archive */
+  retentionArchiveDir?: string | null
 }
 
 export type NormalizedConfig = {
@@ -45,6 +51,9 @@ export type NormalizedConfig = {
   spawnCooldownMs: number
   maxSpawnsPerTurn: number
   projectDirs: Record<string, string>
+  since: string | null
+  retentionDays: number
+  retentionArchiveDir: string | null
 }
 
 function clampInt(value: unknown, def: number, min: number, max: number): number {
@@ -112,6 +121,15 @@ export function normalizeConfig(
   const enabled = typeof opts.enabled === "boolean" ? opts.enabled : true
   const wake = typeof opts.wake === "boolean" ? opts.wake : false
   const pollMs = clampInt(opts.pollMs, 10000, 100, 600000)
+  const since =
+    typeof opts.since === "string" && !Number.isNaN(Date.parse(opts.since))
+      ? new Date(opts.since).toISOString()
+      : null
+  const retentionDays = clampInt(opts.retentionDays, 0, 0, 3650)
+  const retentionArchiveDir =
+    typeof opts.retentionArchiveDir === "string" && opts.retentionArchiveDir.length > 0
+      ? path.resolve(opts.retentionArchiveDir)
+      : null
   const deliverOnSend: DeliverMode =
     opts.deliverOnSend === "reuse" ||
     opts.deliverOnSend === "spawn" ||
@@ -155,5 +173,8 @@ export function normalizeConfig(
     spawnCooldownMs,
     maxSpawnsPerTurn,
     projectDirs,
+    since,
+    retentionDays,
+    retentionArchiveDir,
   }
 }

@@ -3,7 +3,7 @@ import { createRequire } from "node:module"
 import path from "node:path"
 import { messageHash } from "./hash.js"
 import { ackMessage, buildHeader } from "./mailbox.js"
-import { parseMailbox, type MailboxMessage } from "./parser.js"
+import { messageTime, parseMailbox, type MailboxMessage } from "./parser.js"
 import type { AckResult } from "./mailbox.js"
 import type { AppendInput, MailboxFilter, MailboxStore } from "./store.js"
 
@@ -109,6 +109,18 @@ export async function createSqliteStore(
     CREATE INDEX IF NOT EXISTS idx_messages_project_status ON messages(project, status);
     CREATE INDEX IF NOT EXISTS idx_messages_project_hash ON messages(project, hash);
     CREATE TABLE IF NOT EXISTS imported (project TEXT PRIMARY KEY, at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS messages_archive (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project TEXT NOT NULL,
+      header TEXT NOT NULL,
+      sender TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      status TEXT NOT NULL,
+      topic TEXT NOT NULL,
+      body TEXT NOT NULL,
+      hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
   `)
 
   const selectAll = db.prepare(
@@ -128,6 +140,12 @@ export async function createSqliteStore(
   const updateStatus = db.prepare("UPDATE messages SET status = ? WHERE id = ?")
   const selectImport = db.prepare("SELECT at FROM imported WHERE project = ?")
   const markImported = db.prepare("INSERT OR REPLACE INTO imported (project, at) VALUES (?, ?)")
+  const selectDone = db.prepare("SELECT * FROM messages WHERE project = ? AND status = 'DONE'")
+  const insertArchive = db.prepare(
+    `INSERT INTO messages_archive (project, header, sender, recipient, status, topic, body, hash, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+  const deleteRow = db.prepare("DELETE FROM messages WHERE id = ?")
 
   function mirrorFile(project: string): string {
     return path.join(legacyDir, `${project}.md`)
@@ -287,6 +305,28 @@ export async function createSqliteStore(
       // and duplicate what an explicit migration just added.
       markImported.run(project, now())
       return added
+    },
+    archive(project: string, cutoffMs: number): number {
+      const candidates = selectDone.all(project) as SqliteRow[]
+      const move = candidates.filter((row) => {
+        const at = messageTime(rowToMessage(row))
+        return at > 0 && at < cutoffMs
+      })
+      for (const row of move) {
+        insertArchive.run(
+          row.project,
+          row.header,
+          row.sender,
+          row.recipient,
+          row.status,
+          row.topic,
+          row.body,
+          row.hash,
+          row.created_at,
+        )
+        deleteRow.run(row.id)
+      }
+      return move.length
     },
     projects(): string[] {
       const rows = db.prepare("SELECT DISTINCT project FROM messages ORDER BY project").all() as {

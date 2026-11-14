@@ -101,3 +101,20 @@ export function parseMailbox(text: string): MailboxMessage[] {
 export function isOpen(message: MailboxMessage): boolean {
   return message.status === "OPEN"
 }
+
+/**
+ * Timestamp from the message header (`YYYY-MM-DD[ HH:MM]`), local time.
+ * Undated headers return 0, which callers treat as "old".
+ */
+export function messageTime(message: MailboxMessage): number {
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?/.exec(message.header.trim())
+  if (!match) return 0
+  const [, year, month, day, hour = "0", minute = "0"] = match
+  return new Date(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+  ).getTime()
+}

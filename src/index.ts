@@ -5,6 +5,7 @@ import { normalizeConfig, type MailboxConfig, type NormalizedConfig } from "./co
 import { discoverTier, routeRecipient, type TierContext } from "./discovery.js"
 import { messageHash, normalizeForHash } from "./hash.js"
 import {
+  buildHeader,
   type AckRequest,
   type AckResult,
   type ReadResult,
@@ -12,7 +13,7 @@ import {
   type SendResult,
 } from "./mailbox.js"
 import { assertInside, isSafeRecipient, mailboxFile, PathSafetyError, resolveInside } from "./paths.js"
-import { isOpen, parseMailbox, type MailboxMessage } from "./parser.js"
+import { isOpen, messageTime, parseMailbox, type MailboxMessage } from "./parser.js"
 import { buildCapNotice, buildDeliveryPrompt, buildIdlePrompt } from "./prompt.js"
 import { emptyState, StateStore, type MailboxState, type SessionState } from "./state.js"
 import { createFileStore, type MailboxStore } from "./store.js"
@@ -34,6 +35,24 @@ export const server: Plugin = async (input, options) => {
   const cfg: NormalizedConfig = normalizeConfig(options, input.directory)
   const store = new StateStore(cfg.stateFile)
   const { client } = input
+
+  /**
+   * Serializes state read-modify-write sections: a delivery awaits the SDK while
+   * holding state, and an ack can land in between. Without this, one write
+   * silently clobbers the other.
+   */
+  class Serial {
+    private tail: Promise<unknown> = Promise.resolve()
+    run<T>(fn: () => Promise<T> | T): Promise<T> {
+      const next = this.tail.then(fn, fn)
+      this.tail = next.then(
+        () => undefined,
+        () => undefined,
+      )
+      return next
+    }
+  }
+  const stateLock = new Serial()
 
   // Tier is derived from the folder tree unless the config pins a mailboxDir.
   const tier: TierContext = cfg.explicitMailboxDir
@@ -67,7 +86,11 @@ export const server: Plugin = async (input, options) => {
               mirror: cfg.sqliteMirror,
               autoImport,
             })
-          : Promise.resolve(createFileStore(resolved))
+          : Promise.resolve(
+              createFileStore(resolved, {
+                archiveDir: cfg.retentionArchiveDir ?? path.join(resolved, "_archive"),
+              }),
+            )
       stores.set(cacheKey, found)
     }
     return found
@@ -169,7 +192,7 @@ export const server: Plugin = async (input, options) => {
    * Shared decision path for both triggers: the idle transition and the poll
    * timer. `poll` additionally refuses to interrupt a busy session.
    */
-  async function consider(sessionID: string, source: "idle" | "poll"): Promise<void> {
+  async function considerInner(sessionID: string, source: "idle" | "poll"): Promise<void> {
     if (!cfg.enabled) return
     if (pendingCount(sessionID) > 0) return
     if (source === "poll" && sessions.get(sessionID)?.busy) return
@@ -189,8 +212,12 @@ export const server: Plugin = async (input, options) => {
       return
     }
 
+    const sinceMs = cfg.since ? Date.parse(cfg.since) : 0
     const fresh = open.filter(
-      (m) => !state.prompted.includes(m.hash) && !state.ownWrites.includes(m.hash),
+      (m) =>
+        (!sinceMs || messageTime(m) >= sinceMs) &&
+        !state.prompted.includes(m.hash) &&
+        !state.ownWrites.includes(m.hash),
     )
     if (fresh.length === 0) return
 
@@ -230,6 +257,10 @@ export const server: Plugin = async (input, options) => {
           : `read \`${mailboxFile(tier.mailboxDir, tier.project)}\``,
       ),
     )
+  }
+
+  async function consider(sessionID: string, source: "idle" | "poll"): Promise<void> {
+    return stateLock.run(() => considerInner(sessionID, source))
   }
 
   /** The most recently active session that is not mid-turn, if any. */
@@ -397,7 +428,7 @@ export const server: Plugin = async (input, options) => {
    * spawned never delivers), duplicate message, cooldown, per-turn cap, then
    * directory resolution.
    */
-  async function maybeDeliver(
+  async function maybeDeliverInner(
     sessionID: string,
     to: string,
     hash: string,
@@ -476,6 +507,15 @@ export const server: Plugin = async (input, options) => {
     return { delivered: true, created: createdID !== undefined, detail: `${verb} session ${targetID} in ${directory}` }
   }
 
+  async function maybeDeliver(
+    sessionID: string,
+    to: string,
+    hash: string,
+    topic: string,
+  ): Promise<DeliverOutcome> {
+    return stateLock.run(() => maybeDeliverInner(sessionID, to, hash, topic))
+  }
+
   return {
     event: async ({ event }) => {
       if (!cfg.enabled) return
@@ -522,9 +562,11 @@ export const server: Plugin = async (input, options) => {
           pendingPluginPrompts.set(sessionID, { count: count - 1, at: Date.now() })
           return
         }
-        const state = store.read()
-        state.sessions[sessionID] = { autoRounds: 0, lastPromptAt: 0 }
-        store.write(state)
+        await stateLock.run(() => {
+          const fresh = store.read()
+          fresh.sessions[sessionID] = { autoRounds: 0, lastPromptAt: 0 }
+          store.write(fresh)
+        })
       } catch (error) {
         console.error(`[opencode-workspace-mailbox] chat.message handler error: ${String(error)}`)
       }
@@ -577,12 +619,53 @@ export const server: Plugin = async (input, options) => {
         },
         async execute(args, ctx) {
           try {
-            if (!isSafeRecipient(args.to)) {
+            if (args.to !== "all" && !isSafeRecipient(args.to)) {
               return {
                 title: "mailbox_send",
                 output: `Invalid recipient "${args.to}": must be lowercase kebab-case.`,
               }
             }
+
+            // `to: all` is the protocol's broadcast: the same block is copied
+            // into every project file in this tier.
+            if (args.to === "all") {
+              const actor = await own()
+              const projects = Array.from(new Set([...actor.projects(), tier.project]))
+              const topic = args.topic.replace(/\r?\n/g, " ").trim()
+              if (!topic) return { title: "mailbox_send", output: "topic is required" }
+              const body = args.body.trim()
+              const status = args.status ?? "OPEN"
+              const header = buildHeader("all", tier.project, new Date())
+              const hash = messageHash({ header, topic, body })
+              const message: MailboxMessage = {
+                header,
+                from: tier.project,
+                to: "all",
+                status,
+                topic,
+                body,
+                start: -1,
+                end: -1,
+                statusStart: -1,
+                statusEnd: -1,
+                statusLineEnd: -1,
+                hash,
+              }
+              let written = 0
+              for (const project of projects) {
+                if (!isSafeRecipient(project)) continue
+                written += actor.importMessages(project, [message])
+              }
+              store.update((state: MailboxState) => {
+                recordHashes(state.ownWrites, [hash])
+              })
+              return {
+                title: "mailbox_send",
+                output: `Broadcast to ${written} mailbox(es) in ${tier.mailboxDir} (hash ${hash}). Delivery is skipped for broadcasts.`,
+                metadata: { hash, broadcast: written },
+              }
+            }
+
             const route = routeRecipient(args.to, tier)
             const target = await storeFor(route.mailboxDir)
             const result = target.append(route.project, {
@@ -591,9 +674,11 @@ export const server: Plugin = async (input, options) => {
               body: args.body,
               status: args.status,
             })
-            store.update((state: MailboxState) => {
-              recordHashes(state.ownWrites, [result.hash])
-            })
+            await stateLock.run(() =>
+              store.update((state: MailboxState) => {
+                recordHashes(state.ownWrites, [result.hash])
+              }),
+            )
             const delivery = await maybeDeliver(ctx.sessionID, args.to, result.hash, args.topic)
             const suffix = cfg.deliverOnSend === "off" ? "" : ` Delivery: ${delivery.detail}.`
             return {
@@ -739,6 +824,53 @@ export const server: Plugin = async (input, options) => {
         },
       }),
 
+      mailbox_prune: tool({
+        description:
+          "Move DONE messages older than a cutoff into the archive, keeping the active mailbox small. " +
+          "Uses `retentionDays` unless `olderThanDays` is given. Safe to re-run; `dryRun` reports only.",
+        args: {
+          project: tool.schema
+            .string()
+            .optional()
+            .describe("Limit to one project. Defaults to every project in this tier."),
+          olderThanDays: tool.schema
+            .number()
+            .optional()
+            .describe("Override the configured retention window."),
+          dryRun: tool.schema.boolean().optional().describe("Report what would move, change nothing."),
+        },
+        async execute(args) {
+          const days = args.olderThanDays ?? cfg.retentionDays
+          if (!days || days <= 0) {
+            return {
+              title: "mailbox_prune",
+              output:
+                "Retention is off. Set `retentionDays` in the plugin options or pass `olderThanDays`.",
+            }
+          }
+          const cutoff = Date.now() - days * 86_400_000
+          const active = await own()
+          const projects = args.project ? [args.project] : active.projects()
+          const lines: string[] = []
+          for (const project of projects) {
+            if (!isSafeRecipient(project)) continue
+            if (args.dryRun) {
+              const movable = active
+                .read(project)
+                .filter((m) => m.status === "DONE" && messageTime(m) > 0 && messageTime(m) < cutoff)
+              lines.push(`${project}: would archive ${movable.length}`)
+            } else {
+              lines.push(`${project}: archived ${active.archive(project, cutoff)}`)
+            }
+          }
+          return {
+            title: "mailbox_prune",
+            output: `Retention ${days} day(s) in ${tier.mailboxDir}\n${lines.join("\n") || "(nothing to do)"}`,
+            metadata: { days, projects: projects.length },
+          }
+        },
+      }),
+
       mailbox_ack: tool({
         description:
           "Flip a message's `**Status:**` line to DONE. Identify the message by exactly one of " +
@@ -765,7 +897,7 @@ export const server: Plugin = async (input, options) => {
           // backlog can drain one message per wake instead of stalling at the cap.
           if (result.changed) {
             try {
-              restoreBudget(ctx.sessionID)
+              await stateLock.run(() => restoreBudget(ctx.sessionID))
             } catch {
               // budget state is best-effort; the ack already succeeded
             }

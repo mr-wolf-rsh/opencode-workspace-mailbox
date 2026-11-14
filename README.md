@@ -164,6 +164,13 @@ npm install file:C:\work\acme\tools\opencode-workspace-mailbox --save
   // Explicit recipient -> directory map for delivery. Discovery covers most trees.
   "projectDirs": {},
 
+  // Ignore messages older than this ISO date (first-contact watermark).
+  "since": null,
+
+  // Move DONE messages older than N days into the archive (0 = never).
+  "retentionDays": 0,
+  "retentionArchiveDir": null,
+
   // Where dedupe/round/delivery state is persisted (must stay inside the project directory).
   "stateFile": null
 }]
@@ -185,6 +192,9 @@ npm install file:C:\work\acme\tools\opencode-workspace-mailbox --save
 | `spawnCooldownMs` | `60000` | Gap between deliveries. |
 | `maxSpawnsPerTurn` | `1` | Deliveries per human turn, `0..10`. |
 | `projectDirs` | `{}` | Explicit recipient → directory map. |
+| `since` | `null` | Ignore messages older than this ISO date. |
+| `retentionDays` | `0` | Archive DONE messages older than N days (`0` = never). |
+| `retentionArchiveDir` | `<mailboxDir>/_archive` | Archive destination for the file backend. |
 | `stateFile` | `<dir>/.atl/mailbox-state.json` | Persisted dedupe/round/delivery state. |
 
 ## Tiers and identity
@@ -377,24 +387,33 @@ guesses a directory.
 
 ## Scale and retention
 
-The file backend re-reads and re-parses one mailbox file per trigger (idle, or one `wake` poll).
-Measured on this workspace: a **110 KB** mailbox with 59 messages parses in **0.67 ms** — at the
-default 10 s poll that is a rounding error, but the cost is linear and append-only files never
-shrink on their own.
+The file backend re-reads and re-parses one mailbox file per trigger — but only when the file
+changed. A mtime+size fingerprint short-circuits the parse, so an idle mailbox costs one `stat`.
+Measured on this workspace: a **110 KB** mailbox with 59 messages takes **0.67 ms** to parse; the
+cost is linear, and append-only files never shrink on their own.
 
 `storage: "sqlite"` removes the file from the hot path entirely: indexed lookups for
 `(project, status)`, an `INSERT` per message, WAL for concurrent sessions, and no parsing per tick.
 With the mirror on, markdown still grows — but only agents and humans read it, once per handled
 message, never on a timer.
 
-What is still on the table:
+Growth is now bounded by two explicit mechanisms:
 
-1. **Retention** — move `DONE` history older than N days into an archive table (and out of the
-   mirror). The hot path stays small, the audit trail survives.
-2. **`since` watermark** — a new session stops replaying a mailbox's entire history on first contact.
+1. **Retention** — `retentionDays` plus `mailbox_prune` move `DONE` messages older than the window
+   out of the active mailbox. The file backend writes them to `<mailboxDir>/_archive/<project>.md`;
+   the sqlite backend moves the rows to the `messages_archive` table. `OPEN` messages and recent
+   `DONE` history stay.
+2. **`since` watermark** — set an ISO date and everything older is ignored by the wake path, so a
+   fresh install does not replay a mailbox's entire history on first contact.
 
-Until then: per-project files stay bounded by archiving handled threads, which is what `_archive/`
-is for.
+Both are opt-in and safe to re-run (`mailbox_prune({ dryRun: true })` previews).
+
+## Broadcast
+
+The protocol's `to: all` is a real fan-out: the same block is appended to every project mailbox in
+the tier, addressed `to: all`. Delivery is skipped for broadcasts — one message cannot decide which
+session should wake — so each recipient picks it up on its own idle or wake tick. The sender records
+the hash as its own write, so it is never prompted for its own broadcast.
 
 ## Limitations
 
@@ -402,6 +421,9 @@ is for.
   does not open a TUI. A headless session blocked on a permission prompt has nobody to answer it.
 - **SQLite needs a driver**: `bun:sqlite` under OpenCode, or `node:sqlite` on Node ≥ 22.5. The
   plugin reports a clear error instead of silently falling back to files.
+- **Retention rewrites the active file.** It is the one operation that is not append-only — the
+  moved messages are preserved verbatim in `_archive/` (or the archive table) precisely so the
+  audit trail survives.
 - **Delivery needs a resolvable directory.** If the recipient's project folder cannot be found, the
   message is written and the tool reports why nothing was delivered.
 - **One project per plugin instance.** Identity is resolved per session, never shared.
@@ -421,16 +443,13 @@ is for.
 
 Ideas for the future — not implemented yet.
 
-- **Retention policy** — archive `DONE` history older than N days into a table (and out of the
-  mirror) on a schedule or on ack.
 - **Engram backend** — reuse the persistent-memory store for teams that want mailboxes outside the
-  repo. Same seven methods.
-- **`to: all` broadcast** — the protocol allows a broadcast copied into every file in a tier; today
-  `all` is treated as a normal recipient name.
-- **Migration helper** — move legacy top-level files into the tier layout with an explicit,
-  reviewable command instead of leaving them behind.
-- **Watermark** — a `since` option so a fresh install does not replay a mailbox's entire `OPEN`
-  history on first contact.
+  repo. Same interface.
+- **Scheduled retention** — run the prune pass on a timer instead of on demand.
+- **Migration helper for legacy layouts** — move pre-hierarchy top-level files into the tier layout
+  with an explicit, reviewable command instead of leaving them behind.
+- **Cross-process file lock** — the file backend still does read-modify-write on ack; sqlite/WAL
+  does not. A lock file would make the file backend safe for two writers on one mailbox.
 
 ---
 

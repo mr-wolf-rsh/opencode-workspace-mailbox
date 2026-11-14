@@ -1,8 +1,8 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { ackMessage, readMailbox, sendMessage, type AckResult, type SendResult } from "./mailbox.js"
 import { mailboxFile } from "./paths.js"
-import type { MailboxMessage } from "./parser.js"
+import { isOpen, messageTime, parseMailbox, type MailboxMessage } from "./parser.js"
 
 export type MailboxFilter = {
   status?: string
@@ -19,9 +19,8 @@ export type AppendInput = {
 }
 
 /**
- * Storage contract. The file backend is the MVP; a SQLite backend only has to
- * implement these five operations to replace it without touching the tools,
- * the wake path, or spawn-on-send.
+ * Storage contract. Both shipped backends implement it; a new backend only has
+ * to implement these operations for the tools, wake path and delivery to work.
  */
 export interface MailboxStore {
   readonly kind: string
@@ -35,15 +34,46 @@ export interface MailboxStore {
   query(project: string, filter?: MailboxFilter): MailboxMessage[]
   /** Insert messages verbatim (migration). Returns how many were added. */
   importMessages(project: string, messages: MailboxMessage[]): number
+  /** Move DONE messages older than the cutoff into the archive. Returns moved count. */
+  archive(project: string, cutoffMs: number): number
   /** Every project that has messages in this backend. */
   projects(): string[]
   /** Release resources (database handles). Optional for file-backed stores. */
   close?(): void
 }
 
-export function createFileStore(dir: string): MailboxStore {
+export type FileStoreOptions = { archiveDir?: string }
+
+function blockOf(message: MailboxMessage): string {
+  return `### ${message.header}\n**Status:** ${message.status || "OPEN"}\n**Topic:** ${message.topic}\n${message.body}\n`
+}
+
+export function createFileStore(dir: string, options: FileStoreOptions = {}): MailboxStore {
   const root = path.resolve(dir)
+  const archiveDir = options.archiveDir ? path.resolve(options.archiveDir) : path.join(root, "_archive")
   const fileFor = (project: string): string => mailboxFile(root, project)
+
+  // mtime+size short-circuit: an unchanged file is never re-parsed.
+  const cache = new Map<string, { key: string; messages: MailboxMessage[] }>()
+
+  function load(project: string): MailboxMessage[] {
+    const file = fileFor(project)
+    if (!existsSync(file)) {
+      cache.delete(file)
+      return []
+    }
+    const stats = statSync(file)
+    const key = `${stats.mtimeMs}:${stats.size}`
+    const hit = cache.get(file)
+    if (hit && hit.key === key) return hit.messages
+    const messages = parseMailbox(readFileSync(file, "utf8"))
+    cache.set(file, { key, messages })
+    return messages
+  }
+
+  function invalidate(project: string): void {
+    cache.delete(fileFor(project))
+  }
 
   return {
     kind: "file",
@@ -57,17 +87,18 @@ export function createFileStore(dir: string): MailboxStore {
           `# ${project} mailbox\n\nMessages addressed to \`${project}\`. Append-only.\n`,
           "utf8",
         )
+        invalidate(project)
       }
       return target
     },
     listOpen(project: string): MailboxMessage[] {
-      return readMailbox(fileFor(project)).open
+      return load(project).filter(isOpen)
     },
     read(project: string): MailboxMessage[] {
-      return readMailbox(fileFor(project)).messages
+      return load(project)
     },
     append(project: string, input: AppendInput): SendResult {
-      return sendMessage({
+      const result = sendMessage({
         mailboxDir: root,
         to: project,
         from: input.from,
@@ -76,12 +107,16 @@ export function createFileStore(dir: string): MailboxStore {
         status: input.status,
         now: input.now,
       })
+      invalidate(project)
+      return result
     },
     ack(project: string, target: { hash?: string; header?: string }): AckResult {
-      return ackMessage({ file: fileFor(project), hash: target.hash, header: target.header })
+      const result = ackMessage({ file: fileFor(project), hash: target.hash, header: target.header })
+      if (result.changed) invalidate(project)
+      return result
     },
     query(project: string, filter: MailboxFilter = {}): MailboxMessage[] {
-      let list = readMailbox(fileFor(project)).messages
+      let list = load(project)
       if (filter.status) {
         const wanted = filter.status.toUpperCase()
         list = list.filter((message) => message.status === wanted)
@@ -106,11 +141,40 @@ export function createFileStore(dir: string): MailboxStore {
       }
       let endsWithNewline = readFileSync(target, "utf8").endsWith("\n")
       for (const message of messages) {
-        const block = `### ${message.header}\n**Status:** ${message.status || "OPEN"}\n**Topic:** ${message.topic}\n${message.body}\n`
+        const block = blockOf(message)
         appendFileSync(target, `${endsWithNewline ? "\n" : "\n\n"}${block}`, "utf8")
-        endsWithNewline = block.endsWith("\n")
+        endsWithNewline = true
       }
+      invalidate(project)
       return messages.length
+    },
+    archive(project: string, cutoffMs: number): number {
+      const messages = load(project)
+      const keep: MailboxMessage[] = []
+      const move: MailboxMessage[] = []
+      for (const message of messages) {
+        if (message.status === "DONE" && messageTime(message) > 0 && messageTime(message) < cutoffMs) {
+          move.push(message)
+        } else {
+          keep.push(message)
+        }
+      }
+      if (move.length === 0) return 0
+
+      const target = fileFor(project)
+      const header = `# ${project} mailbox\n\nMessages addressed to \`${project}\`. Append-only.\n`
+      const kept = keep.map(blockOf).join("\n")
+      writeFileSync(target, keep.length > 0 ? `${header}\n${kept}` : header, "utf8")
+
+      mkdirSync(archiveDir, { recursive: true })
+      const archiveFile = path.join(archiveDir, `${project}.md`)
+      const preamble = existsSync(archiveFile)
+        ? ""
+        : `# ${project} archive\n\nMessages moved out of the active mailbox by retention.\n\n`
+      appendFileSync(archiveFile, preamble + move.map(blockOf).join("\n"), "utf8")
+
+      invalidate(project)
+      return move.length
     },
     projects(): string[] {
       if (!existsSync(root)) return []
