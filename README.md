@@ -10,7 +10,7 @@ directory a session opens in, not from what you remember to configure.
 Built for OpenCode today; the storage layer is behind a `MailboxStore` interface, so the file
 backend can be swapped for SQLite or Engram — see [Backlog](#backlog).
 
-> Status: the code is complete (81 tests, `typecheck` and `build` green, repo at
+> Status: the code is complete (123 tests, `typecheck` and `build` green, repo at
 > [opencode-workspace-mailbox](https://github.com/mr-wolf-rsh/opencode-workspace-mailbox)).
 > It is not yet published to npm — see [Install](#install).
 
@@ -63,6 +63,8 @@ Delivered as tools the agent calls and two hooks the runtime calls:
   else.
 - **`mailbox_status`** — backend, locations, and per-project counts for both backends.
 - **`mailbox_migrate`** — copy every message between backends, idempotently; `dryRun` supported.
+- **`mailbox_prune`** — apply `retentionDays`, moving old `DONE` messages to the archive; `dryRun`
+  supported.
 
 On `session.idle` (and, with `wake: true`, on a timer) the plugin reads the session's own mailbox,
 finds `OPEN` messages it has not handled yet, and prompts the session **once** to deal with them.
@@ -164,6 +166,11 @@ npm install file:C:\work\acme\tools\opencode-workspace-mailbox --save
   // Explicit recipient -> directory map for delivery. Discovery covers most trees.
   "projectDirs": {},
 
+  // Append a row for a new recipient to the tier README's `## Files` table on
+  // first send. Off by default: that README is hand-authored documentation, and
+  // the protocol treats it as the authoritative file list.
+  "registerRecipients": false,
+
   // Ignore messages older than this ISO date (first-contact watermark).
   "since": null,
 
@@ -192,6 +199,7 @@ npm install file:C:\work\acme\tools\opencode-workspace-mailbox --save
 | `spawnCooldownMs` | `60000` | Gap between deliveries. |
 | `maxSpawnsPerTurn` | `1` | Deliveries per human turn, `0..10`. |
 | `projectDirs` | `{}` | Explicit recipient → directory map. |
+| `registerRecipients` | `false` | Add a new recipient's row to the tier README's `## Files` table. |
 | `since` | `null` | Ignore messages older than this ISO date. |
 | `retentionDays` | `0` | Archive DONE messages older than N days (`0` = never). |
 | `retentionArchiveDir` | `<mailboxDir>/_archive` | Archive destination for the file backend. |
@@ -345,7 +353,9 @@ flipping `storage`.
    (surfacing a one-line toast at most once per pending set).
 5. **Dispatch** — record every hash *before* prompting, then send one prompt: load the
    `workspace-mailbox` skill, read the file, handle the messages, ack them, reply only if a decision
-   is needed.
+   is needed. The prompt also carries the protocol itself — use the `mailbox_*` tools, append-only,
+   how to route by recipient, and never write another project's `SESSION.md` — so a session acts
+   correctly even when the skill is absent or out of date.
 
 Hashes are recorded before dispatch on purpose: a failed prompt is retried, never silently dropped.
 
@@ -437,8 +447,10 @@ the hash as its own write, so it is never prompted for its own broadcast.
 - **Busy detection is event-driven.** If a runtime never emits `session.status`, the wake path can
   queue a prompt behind an active turn instead of waiting.
 - **Message bodies are data only.** They are never executed, evaluated, or turned into commands.
-- **New recipient files are not registered in the tier's `README.md`.** The plugin writes mailboxes,
-  not documentation.
+- **New recipient files are only registered in the tier's `README.md` when
+  `registerRecipients: true`.** Off by default, because the plugin writes mailboxes and the tier
+  README is documentation. When on, it inserts one row into the existing `## Files` table, never
+  creates the README, and never rewrites a row.
 
 ---
 

@@ -30,6 +30,11 @@ export type MailboxConfig = {
   retentionDays?: number
   /** Archive destination for the file backend. Default: <mailboxDir>/_archive */
   retentionArchiveDir?: string | null
+  /**
+   * Append a row for a new recipient to the tier README's `## Files` table on
+   * first send. Off by default: the tier README is hand-authored documentation.
+   */
+  registerRecipients?: boolean
 }
 
 export type NormalizedConfig = {
@@ -54,6 +59,7 @@ export type NormalizedConfig = {
   since: string | null
   retentionDays: number
   retentionArchiveDir: string | null
+  registerRecipients: boolean
 }
 
 function clampInt(value: unknown, def: number, min: number, max: number): number {
@@ -130,6 +136,7 @@ export function normalizeConfig(
     typeof opts.retentionArchiveDir === "string" && opts.retentionArchiveDir.length > 0
       ? path.resolve(opts.retentionArchiveDir)
       : null
+  const registerRecipients = opts.registerRecipients === true
   const deliverOnSend: DeliverMode =
     opts.deliverOnSend === "reuse" ||
     opts.deliverOnSend === "spawn" ||
@@ -176,5 +183,6 @@ export function normalizeConfig(
     since,
     retentionDays,
     retentionArchiveDir,
+    registerRecipients,
   }
 }

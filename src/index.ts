@@ -15,6 +15,7 @@ import {
 import { assertInside, isSafeRecipient, mailboxFile, PathSafetyError, resolveInside } from "./paths.js"
 import { isOpen, messageTime, parseMailbox, type MailboxMessage } from "./parser.js"
 import { buildCapNotice, buildDeliveryPrompt, buildIdlePrompt } from "./prompt.js"
+import { registerRecipient } from "./registry.js"
 import { emptyState, StateStore, type MailboxState, type SessionState } from "./state.js"
 import { createFileStore, type MailboxStore } from "./store.js"
 import { createSqliteStore } from "./sqlite-store.js"
@@ -674,17 +675,33 @@ export const server: Plugin = async (input, options) => {
               body: args.body,
               status: args.status,
             })
+            // The tier README is documentation, not storage: register the new
+            // recipient so the protocol's authoritative file list stays true,
+            // but never fail a send because of it.
+            let registered: string | null = null
+            if (cfg.registerRecipients) {
+              try {
+                if (registerRecipient(path.join(route.mailboxDir, "README.md"), route.project) === "registered") {
+                  registered = route.project
+                }
+              } catch {
+                registered = null
+              }
+            }
             await stateLock.run(() =>
               store.update((state: MailboxState) => {
                 recordHashes(state.ownWrites, [result.hash])
               }),
             )
             const delivery = await maybeDeliver(ctx.sessionID, args.to, result.hash, args.topic)
-            const suffix = cfg.deliverOnSend === "off" ? "" : ` Delivery: ${delivery.detail}.`
+            const notes: string[] = []
+            if (registered) notes.push(`Registered ${registered}.md in the tier README.`)
+            if (cfg.deliverOnSend !== "off") notes.push(`Delivery: ${delivery.detail}.`)
+            const suffix = notes.length > 0 ? ` ${notes.join(" ")}` : ""
             return {
               title: "mailbox_send",
               output: `Appended message to ${args.to} (hash ${result.hash}) in ${result.file}.${suffix}`,
-              metadata: { hash: result.hash, delivered: delivery.delivered, spawned: delivery.created },
+              metadata: { hash: result.hash, delivered: delivery.delivered, spawned: delivery.created, registered },
             }
           } catch (error) {
             return { title: "mailbox_send", output: `Failed to send message: ${String(error)}` }

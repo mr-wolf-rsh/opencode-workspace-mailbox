@@ -79,6 +79,12 @@ describe("normalizeConfig", () => {
     expect(() => normalizeConfig({ stateFile: "../../x.json" }, base)).toThrow(PathSafetyError)
   })
 
+  it("defaults registerRecipients to false and only accepts a real boolean", () => {
+    expect(normalizeConfig(undefined, base).registerRecipients).toBe(false)
+    expect(normalizeConfig({ registerRecipients: true }, base).registerRecipients).toBe(true)
+    expect(normalizeConfig({ registerRecipients: "yes" } as never, base).registerRecipients).toBe(false)
+  })
+
   it("rejects an invalid project name", () => {
     expect(() => normalizeConfig({ project: "Bad Name" }, base)).toThrow(/Invalid project name/)
     expect(() => normalizeConfig({ project: "UPPER" }, base)).toThrow(/Invalid project name/)
