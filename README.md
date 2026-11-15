@@ -11,8 +11,8 @@ Built for OpenCode today; the storage layer is behind a `MailboxStore` interface
 backend can be swapped for SQLite or Engram — see [Backlog](#backlog).
 
 > Status: the code is complete (123 tests, `typecheck` and `build` green, repo at
-> [opencode-workspace-mailbox](https://github.com/mr-wolf-rsh/opencode-workspace-mailbox)).
-> It is not yet published to npm — see [Install](#install).
+> [mr-wolf-rsh/opencode-workspace-mailbox](https://github.com/mr-wolf-rsh/opencode-workspace-mailbox)).
+> Published on npm — see [Install](#install).
 
 ## The metaphor
 
