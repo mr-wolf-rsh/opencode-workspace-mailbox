@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs"
+import { existsSync, readdirSync } from "node:fs"
 import path from "node:path"
 
 export type Tier = "meta" | "account" | "repo" | "custom"
@@ -125,6 +125,46 @@ export function routeRecipient(to: string, ctx: TierContext): Route {
   }
 
   return { mailboxDir: ctx.mailboxDir, project: to }
+}
+
+export type SiblingTier = {
+  /** Kebab-cased directory name of the sibling tier root. */
+  name: string
+  /** The sibling tier's own `handoffs` directory. */
+  mailboxDir: string
+  /** The sibling tier's root directory (its parent holds the shared `handoffs`). */
+  tierRoot: string
+}
+
+/**
+ * Tier roots that sit directly under this tier's root and are not the current
+ * mailbox — the account inboxes a container/meta (or nested repo) session can
+ * see but does not own. Only immediate children of `rootDir` are considered, so
+ * nothing outside the workspace tree is scanned. An explicit `custom` mailbox
+ * never fans out: an explicit `mailboxDir` overrides discovery entirely.
+ */
+export function siblingAccountTiers(ctx: TierContext): SiblingTier[] {
+  if (ctx.tier === "custom") return []
+  const root = ctx.rootDir
+  if (!root) return []
+  const current = path.resolve(ctx.mailboxDir)
+  let entries: string[]
+  try {
+    entries = readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+  } catch {
+    return []
+  }
+  const siblings: SiblingTier[] = []
+  for (const name of entries) {
+    const tierRoot = path.join(root, name)
+    const mailboxDir = path.join(tierRoot, "handoffs")
+    if (path.resolve(mailboxDir) === current) continue
+    if (!hasHandoffs(tierRoot)) continue
+    siblings.push({ name: kebab(name), mailboxDir, tierRoot })
+  }
+  return siblings
 }
 
 function isStrictlyInside(base: string, candidate: string): boolean {

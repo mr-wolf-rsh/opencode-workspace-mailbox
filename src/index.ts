@@ -2,7 +2,7 @@ import { tool, type Plugin } from "@opencode-ai/plugin"
 import { existsSync, readdirSync, readFileSync, type Dirent } from "node:fs"
 import path from "node:path"
 import { normalizeConfig, type MailboxConfig, type NormalizedConfig } from "./config.js"
-import { discoverTier, routeRecipient, type TierContext } from "./discovery.js"
+import { discoverTier, routeRecipient, siblingAccountTiers, type TierContext } from "./discovery.js"
 import { messageHash, normalizeForHash } from "./hash.js"
 import {
   buildHeader,
@@ -751,6 +751,33 @@ export const server: Plugin = async (input, options) => {
             const otherLines = describe(other)
             lines.push(...(otherLines.length > 0 ? otherLines : ["  (empty)"]))
           }
+
+          // Never let a neighbouring account's file inbox disappear silently:
+          // with sqlite active, count OPEN file messages that its own database
+          // does not hold yet and point at the migration that imports them.
+          if (cfg.storage === "sqlite") {
+            const warnings: string[] = []
+            for (const sibling of siblingAccountTiers(tier)) {
+              const source = await storeForBackend("file", sibling.mailboxDir)
+              const fileProjects = source.projects()
+              if (fileProjects.length === 0) continue
+              const siblingDb = databaseFileFor(sibling.mailboxDir)
+              const dest = existsSync(siblingDb)
+                ? await storeForBackend("sqlite", sibling.mailboxDir, { autoImport: false })
+                : undefined
+              let pending = 0
+              for (const project of fileProjects) {
+                const inDb = new Set((dest?.read(project) ?? []).map((message) => message.hash))
+                pending += source
+                  .read(project)
+                  .filter((message) => isOpen(message) && !inDb.has(message.hash)).length
+              }
+              if (pending > 0) {
+                warnings.push(`  ${sibling.name}: ${pending} unread not imported (run mailbox_migrate here)`)
+              }
+            }
+            if (warnings.length > 0) lines.push("other tiers (file):", ...warnings)
+          }
           return { title: "mailbox_status", output: lines.join("\n") }
         },
       }),
@@ -828,6 +855,41 @@ export const server: Plugin = async (input, options) => {
                 ? importFileIntoStore(project, file, target!)
                 : exportStoreIntoFile(project, file, source)
             reports.push(`${project}: added ${report.added}, acked ${report.acked}`)
+          }
+
+          // Cross-tier: a container/meta (or nested repo) session can import the
+          // file inboxes of neighbouring account tiers into *their own* databases,
+          // so switching to sqlite never leaves a sibling inbox silently invisible.
+          if (targetKind === "sqlite") {
+            for (const sibling of siblingAccountTiers(tier)) {
+              const siblingSource = await storeForBackend("file", sibling.mailboxDir)
+              const discovered = siblingSource.projects()
+              const siblingProjects = args.project
+                ? discovered.filter((name) => name === args.project)
+                : discovered
+              if (siblingProjects.length === 0) continue
+              const siblingDb = databaseFileFor(sibling.mailboxDir)
+              const siblingTarget =
+                args.dryRun && !existsSync(siblingDb)
+                  ? undefined
+                  : await storeForBackend("sqlite", sibling.mailboxDir, { autoImport: false })
+              const lines: string[] = []
+              for (const project of siblingProjects) {
+                if (!isSafeRecipient(project)) continue
+                const file = mailboxFile(sibling.mailboxDir, project)
+                if (args.dryRun) {
+                  const from = existsSync(file) ? parseMailbox(readFileSync(file, "utf8")) : []
+                  const into = siblingTarget?.read(project) ?? []
+                  lines.push(
+                    `  ${project}: would add ${missingMessages(from, into).length}, would ack ${statusUpdates(from, into).length}`,
+                  )
+                  continue
+                }
+                const report = importFileIntoStore(project, file, siblingTarget!)
+                lines.push(`  ${project}: added ${report.added}, acked ${report.acked}`)
+              }
+              reports.push(`account ${sibling.name} (${sibling.mailboxDir}):`, ...lines)
+            }
           }
 
           return {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { discoverTier, routeRecipient } from "../src/discovery.js"
+import { discoverTier, routeRecipient, siblingAccountTiers } from "../src/discovery.js"
 
 let tmp: string
 
@@ -169,5 +169,52 @@ describe("routeRecipient", () => {
       mailboxDir: path.join(tmp, "handoffs"),
       project: "acme",
     })
+  })
+})
+
+describe("siblingAccountTiers", () => {
+  it("lists every child account tier from the meta root", () => {
+    workspace(tmp)
+    workspace(path.join(tmp, "acme"))
+    workspace(path.join(tmp, "globex"))
+
+    const siblings = siblingAccountTiers(discoverTier(tmp))
+    expect(siblings.map((entry) => entry.name).sort()).toEqual(["acme", "globex"])
+    expect(siblings.map((entry) => entry.mailboxDir).sort()).toEqual(
+      [path.join(tmp, "acme", "handoffs"), path.join(tmp, "globex", "handoffs")].sort(),
+    )
+  })
+
+  it("from an account tier lists the other accounts, never itself", () => {
+    workspace(tmp)
+    workspace(path.join(tmp, "acme"))
+    workspace(path.join(tmp, "globex"))
+
+    const siblings = siblingAccountTiers(discoverTier(path.join(tmp, "acme")))
+    expect(siblings.map((entry) => entry.name)).toEqual(["globex"])
+  })
+
+  it("ignores non-tier children and reports nothing without a root", () => {
+    workspace(tmp)
+    workspace(path.join(tmp, "acme"))
+    fs.mkdirSync(path.join(tmp, "scratch"), { recursive: true })
+
+    expect(siblingAccountTiers(discoverTier(tmp)).map((entry) => entry.name)).toEqual(["acme"])
+
+    // A tier with no shared root above it has nothing to fan out to.
+    const noRoot = {
+      tier: "repo" as const,
+      project: "solo",
+      mailboxDir: path.join(tmp, "solo", "handoffs"),
+      directory: path.join(tmp, "solo"),
+    }
+    expect(siblingAccountTiers(noRoot)).toEqual([])
+  })
+
+  it("does not fan out for an explicit (custom) mailboxDir", () => {
+    workspace(tmp)
+    workspace(path.join(tmp, "acme"))
+    const ctx = discoverTier(tmp, { mailboxDir: path.join(tmp, "handoffs"), project: "pinned" })
+    expect(siblingAccountTiers(ctx)).toEqual([])
   })
 })

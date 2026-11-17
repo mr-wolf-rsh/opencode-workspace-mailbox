@@ -53,6 +53,32 @@ async function setup(options: Record<string, unknown> = {}) {
   })
 }
 
+/** Like setup(), but without an explicit mailboxDir so tier discovery runs. */
+async function setupAt(directory: string, options: Record<string, unknown> = {}) {
+  prompts = []
+  const client = {
+    session: {
+      prompt: async (params: Record<string, unknown>) => {
+        const parts = (params.body as { parts?: Array<{ text?: string }> })?.parts ?? []
+        prompts.push(parts.map((part) => part.text ?? "").join("\n"))
+        return {}
+      },
+      list: async () => ({ data: [] }),
+    },
+    tui: { showToast: async () => true },
+  }
+  const input = {
+    client,
+    project: { id: "p", worktree: directory, time: { created: 0 } },
+    directory,
+    worktree: directory,
+    experimental_workspace: { register() {} },
+    serverUrl: new URL("http://localhost:4096"),
+    $: {},
+  } as unknown as Parameters<typeof server>[0]
+  hooks = await server(input, { cooldownMs: 0, ...options })
+}
+
 const idle = async (sid = "s1") => {
   await hooks!.event!({
     event: { type: "session.idle", properties: { sessionID: sid } } as never,
@@ -176,5 +202,63 @@ describe("retention", () => {
     expect(preview.output).toContain("would archive 1")
     const applied = await hooks!.tool.mailbox_prune.execute({}, {} as never)
     expect(applied.output).toContain("archived 1")
+  })
+})
+
+describe.skipIf(!available)("cross-tier sqlite import (issue #1)", () => {
+  const oneOpen = (project: string, topic: string) =>
+    `### 2026-11-09 10:00 — from workspace → to ${project}\n**Status:** OPEN\n**Topic:** ${topic}\nbody\n`
+
+  async function seedTwoAccounts(container: string) {
+    fs.writeFileSync(
+      path.join(container, "handoffs", "workspace.md"),
+      "# workspace mailbox\n\nMessages addressed to `workspace`. Append-only.\n",
+      "utf8",
+    )
+    const accounts = [
+      { name: "acme", project: "alpha", topic: "alpha-topic" },
+      { name: "globex", project: "beta", topic: "beta-topic" },
+    ]
+    for (const account of accounts) {
+      const handoffs = path.join(container, account.name, "handoffs")
+      fs.mkdirSync(handoffs, { recursive: true })
+      fs.writeFileSync(path.join(handoffs, `${account.project}.md`), oneOpen(account.project, account.topic), "utf8")
+    }
+    return accounts
+  }
+
+  it("warns about unimported sibling inboxes, then imports them into their own databases", async () => {
+    const container = tmp
+    const accounts = await seedTwoAccounts(container)
+    await setupAt(container, { storage: "sqlite" })
+
+    const before = await hooks!.tool.mailbox_status.execute({} as never, {} as never)
+    expect(before.output).toContain("acme")
+    expect(before.output).toContain("1 unread")
+    expect(before.output).toContain("not imported")
+
+    const first = await hooks!.tool.mailbox_migrate.execute({ to: "sqlite" } as never, {} as never)
+    expect(first.output).toContain("acme")
+    expect(first.output).toContain("globex")
+
+    for (const account of accounts) {
+      const dir = path.join(container, account.name, "handoffs")
+      const store = await createSqliteStore(path.join(dir, ".mailbox.db"), { legacyDir: dir, autoImport: false })
+      expect(store.listOpen(account.project)).toHaveLength(1)
+      store.close?.()
+    }
+
+    // Idempotent: a second run adds nothing.
+    await hooks!.tool.mailbox_migrate.execute({ to: "sqlite" } as never, {} as never)
+    const again = await createSqliteStore(path.join(container, "acme", "handoffs", ".mailbox.db"), {
+      legacyDir: path.join(container, "acme", "handoffs"),
+      autoImport: false,
+    })
+    expect(again.read("alpha")).toHaveLength(1)
+    again.close?.()
+
+    // Once imported, the warning disappears.
+    const after = await hooks!.tool.mailbox_status.execute({} as never, {} as never)
+    expect(after.output).not.toContain("not imported")
   })
 })

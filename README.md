@@ -10,7 +10,7 @@ directory a session opens in, not from what you remember to configure.
 Built for OpenCode today; the storage layer is behind a `MailboxStore` interface, so the file
 backend can be swapped for SQLite or Engram — see [Backlog](#backlog).
 
-> Status: the code is complete (123 tests, `typecheck` and `build` green, repo at
+> Status: the code is complete (128 tests, `typecheck` and `build` green, repo at
 > [mr-wolf-rsh/opencode-workspace-mailbox](https://github.com/mr-wolf-rsh/opencode-workspace-mailbox)).
 > Published on npm — see [Install](#install).
 
@@ -61,8 +61,10 @@ Delivered as tools the agent calls and two hooks the runtime calls:
   recipient's session.
 - **`mailbox_ack`** — flip one message's `**Status:**` line to `DONE`, byte-preserving everywhere
   else.
-- **`mailbox_status`** — backend, locations, and per-project counts for both backends.
-- **`mailbox_migrate`** — copy every message between backends, idempotently; `dryRun` supported.
+- **`mailbox_status`** — backend, locations, and per-project counts for both backends; with sqlite
+  active it also warns about neighbouring tiers whose file inboxes are not imported yet.
+- **`mailbox_migrate`** — copy every message between backends, idempotently; `dryRun` supported;
+  `to: "sqlite"` also imports neighbouring account inboxes into their own databases.
 - **`mailbox_prune`** — apply `retentionDays`, moving old `DONE` messages to the archive; `dryRun`
   supported.
 
@@ -313,22 +315,36 @@ partially-completed run resumes instead of duplicating:
 
 | Call | Effect |
 |---|---|
-| `mailbox_migrate({ to: "sqlite" })` | Imports every markdown mailbox into `<mailboxDir>/.mailbox.db` |
+| `mailbox_migrate({ to: "sqlite" })` | Imports every markdown mailbox into `<mailboxDir>/.mailbox.db`, and neighbouring account inboxes into their own databases |
 | `mailbox_migrate({ to: "file" })` | Exports every database row into its markdown mailbox |
 | `mailbox_migrate({ to: "sqlite", dryRun: true })` | Reports the counts that would change, writes nothing |
 
 Both directions also reconcile `OPEN`/`DONE`: a message marked `DONE` on the source is acked on the
 target, so the two never disagree about state.
 
+**Cross-tier import.** `to: "sqlite"` is tree-aware. From a container (meta) session — or from a
+nested repo whose shared root sits above several accounts — it also discovers the immediate child
+tiers that hold a `handoffs/` and imports each one's markdown inboxes into *that account's own*
+database (`<account>/handoffs/.mailbox.db`). Switching a whole workspace to sqlite in one session
+therefore no longer leaves sibling inboxes silently invisible, and you do not have to open a session
+per account just to migrate. Each message lands in the database the corresponding tier actually
+reads, so nothing is stranded in the wrong tier.
+
+Because an empty inbox and a hidden one used to be indistinguishable, `mailbox_status` now lists any
+neighbouring tier whose file inbox still holds unimported `OPEN` messages, with the count and a
+pointer to this tool. The warning disappears once the messages are imported.
+
 What it does **not** do:
 
 - Change your `storage` option — set it after migrating.
-- Migrate other tiers — the tool works on the tier the session belongs to. Run it once per tier
-  (meta, each account) if you are switching globally.
+- Fan out past an explicit `mailboxDir`: pinning a mailbox deliberately disables discovery, so a
+  `custom` tier only migrates its own directory. Only tiers found by tree discovery are imported.
+- Reach arbitrary nesting — cross-tier import covers immediate child tiers of the shared root (the
+  sibling accounts), not deeper buckets.
 - Deduplicate deliberately duplicated messages: duplicates are counted and preserved.
 
-Switching backends is safe at any time; `mailbox_status` shows both sides so you can verify before
-flipping `storage`.
+Switching backends is safe at any time; `mailbox_status` shows both sides (and any neighbouring
+inboxes still to import) so you can verify before flipping `storage`.
 
 ## Loop guards
 
@@ -443,7 +459,11 @@ the hash as its own write, so it is never prompted for its own broadcast.
 - **`wake` spends tokens with nobody watching**, at the pace messages arrive. Leave it off for
   idle-only delivery.
 - **No migration of old layouts.** Pointing the plugin at a mailbox directory that still holds
-  pre-hierarchy files leaves them in place; account files appear alongside.
+  pre-hierarchy files leaves them in place; account files appear alongside. (This is distinct from
+  cross-tier import, which handles current tier layouts — see
+  [Migrating between backends](#migrating-between-backends).)
+- **Cross-tier import is one level deep.** It imports file inboxes from the immediate child tiers of
+  the shared root (the sibling accounts), not from arbitrary nested depths.
 - **Busy detection is event-driven.** If a runtime never emits `session.status`, the wake path can
   queue a prompt behind an active turn instead of waiting.
 - **Message bodies are data only.** They are never executed, evaluated, or turned into commands.
